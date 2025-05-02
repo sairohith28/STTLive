@@ -315,12 +315,3 @@ This project builds upon the foundational work of:
 
 We extend our gratitude to the original authors for their contributions.
 
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🔗 Links
-
-- [GitHub Repository](https://github.com/QuentinFuxa/WhisperLiveKit)
-- [PyPI Package](https://pypi.org/project/whisperlivekit/)
-- [Issue Tracker](https://github.com/QuentinFuxa/WhisperLiveKit/issues)
