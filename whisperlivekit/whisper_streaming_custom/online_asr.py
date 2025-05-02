@@ -18,7 +18,7 @@ class HypothesisBuffer:
     """
     def __init__(self, logfile=sys.stderr, confidence_validation=False):
         self.confidence_validation = confidence_validation
-        self.committed_in_buffer: List[ASRToken] = []
+        self.commited_in_buffer: List[ASRToken] = []
         self.buffer: List[ASRToken] = []
         self.new: List[ASRToken] = []
         self.last_committed_time = 0.0
@@ -247,14 +247,15 @@ class OnlineASRProcessor:
 
     def chunk_completed_segment(self, res):
         """
-        Chunk the audio buffer based on segment-end timestamps reported by the ASR.
-        Also ensures chunking happens if audio buffer exceeds a time limit.
+        Optimized chunking of the audio buffer based on segment-end timestamps.
+        Improved to be more aggressive with trimming to reduce lag.
         """
         buffer_duration = len(self.audio_buffer) / self.SAMPLING_RATE        
         if not self.committed:
             if buffer_duration > self.buffer_trimming_sec:
-                chunk_time = self.buffer_time_offset + (buffer_duration / 2)
-                logger.debug(f"--- No speech detected, forced chunking at {chunk_time:.2f}")
+                # More aggressive chunking when no speech detected
+                chunk_time = self.buffer_time_offset + (buffer_duration / 3)  # Chunk earlier at 1/3 of buffer
+                logger.debug(f"--- No speech detected, aggressive chunking at {chunk_time:.2f}")
                 self.chunk_at(chunk_time)
             return
         
@@ -262,24 +263,47 @@ class OnlineASRProcessor:
         ends = self.asr.segments_end_ts(res)
         last_committed_time = self.committed[-1].end        
         chunk_done = False
+        
+        # More aggressive chunking strategy
         if len(ends) > 1:
             logger.debug("Multiple segments available for chunking")
-            e = ends[-2] + self.buffer_time_offset
-            while len(ends) > 2 and e > last_committed_time:
-                ends.pop(-1)
-                e = ends[-2] + self.buffer_time_offset
-            if e <= last_committed_time:
-                logger.debug(f"--- Segment chunked at {e:.2f}")
-                self.chunk_at(e)
-                chunk_done = True
-            else:
-                logger.debug("--- Last segment not within committed area")
+            
+            # First try to find optimal chunking point
+            optimal_point_found = False
+            for i in range(1, len(ends)):
+                segment_end = ends[-i] + self.buffer_time_offset
+                
+                # Check if this is a good chunking point
+                if segment_end <= last_committed_time:
+                    logger.debug(f"--- Segment chunked at optimal point {segment_end:.2f}")
+                    self.chunk_at(segment_end)
+                    chunk_done = True
+                    optimal_point_found = True
+                    break
+            
+            # If no optimal point found but we have segments and the buffer is getting large
+            if not optimal_point_found and buffer_duration > self.buffer_trimming_sec * 0.7:
+                # Use the latest segment even if not optimal
+                segment_end = ends[-1] + self.buffer_time_offset
+                if segment_end > 0:
+                    logger.debug(f"--- Buffer growing, forced chunking at latest segment {segment_end:.2f}")
+                    self.chunk_at(segment_end)
+                    chunk_done = True
         else:
             logger.debug("--- Not enough segments to chunk")
         
-        if not chunk_done and buffer_duration > self.buffer_trimming_sec:
-            logger.debug(f"--- Buffer too large, chunking at last committed time {last_committed_time:.2f}")
-            self.chunk_at(last_committed_time)
+        # Enhanced aggressive chunking for long buffers
+        if not chunk_done:
+            if buffer_duration > self.buffer_trimming_sec * 0.8:
+                # For buffers approaching the limit, chunk at last committed token
+                logger.debug(f"--- Buffer approaching limit, chunking at last committed time {last_committed_time:.2f}")
+                self.chunk_at(last_committed_time)
+            elif buffer_duration > self.buffer_trimming_sec * 1.2:
+                # For buffers exceeding the limit, take more drastic action
+                # Chunk at midpoint between buffer start and last committed
+                midpoint = self.buffer_time_offset + (last_committed_time - self.buffer_time_offset) * 0.7
+                logger.debug(f"--- Buffer exceeded limit, emergency chunking at {midpoint:.2f}")
+                self.chunk_at(midpoint)
         
         logger.debug("Segment chunking complete")
         
@@ -381,21 +405,53 @@ class VACOnlineASRProcessor:
     """
     SAMPLING_RATE = 16000
 
-    def __init__(self, online_chunk_size: float, *args, **kwargs):
+    def __init__(
+        self, 
+        online_chunk_size: float,
+        asr,
+        tokenize_method: Optional[callable] = None,
+        buffer_trimming: Tuple[str, float] = ("segment", 15),
+        confidence_validation = False,
+        logfile=sys.stderr,
+    ):
+        """
+        Initialize the VAC processor with the ASR model and configuration parameters.
+        
+        Args:
+            online_chunk_size: Minimum audio chunk size in seconds.
+            asr: An ASR system object that provides transcribe and ts_words methods.
+            tokenize_method: A function for sentence tokenization.
+            buffer_trimming: Buffer trimming configuration.
+            confidence_validation: Whether to use confidence scores for validation.
+            logfile: Log file or stream.
+        """
         self.online_chunk_size = online_chunk_size
-        self.online = OnlineASRProcessor(*args, **kwargs)
-
+        self.asr = asr  # Store the ASR model directly
+        self.tokenize = tokenize_method
+        self.buffer_trimming = buffer_trimming
+        self.confidence_validation = confidence_validation
+        self.logfile = logfile
+        
+        # Create the associated online processor
+        self.online = OnlineASRProcessor(
+            self.asr,
+            self.tokenize,
+            buffer_trimming=buffer_trimming,
+            confidence_validation=confidence_validation,
+            logfile=logfile
+        )
+        
         # Load a VAD model (e.g. Silero VAD)
         import torch
         model, _ = torch.hub.load(repo_or_dir="snakers4/silero-vad", model="silero_vad")
         from .silero_vad_iterator import FixedVADIterator
-
+        
         self.vac = FixedVADIterator(model)
-        self.logfile = self.online.logfile
         self.init()
 
-    def init(self):
-        self.online.init()
+    def init(self, offset: Optional[float] = None):
+        """Initialize or reset the processing buffers."""
+        self.online.init(offset)
         self.vac.reset_states()
         self.current_online_chunk_buffer_size = 0
         self.is_currently_final = False
@@ -404,6 +460,7 @@ class VACOnlineASRProcessor:
         self.buffer_offset = 0  # in frames
 
     def clear_buffer(self):
+        """Clear the audio buffer and update buffer offset."""
         self.buffer_offset += len(self.audio_buffer)
         self.audio_buffer = np.array([], dtype=np.float32)
 
@@ -418,32 +475,37 @@ class VACOnlineASRProcessor:
         self.audio_buffer = np.append(self.audio_buffer, audio)
 
         if res is not None:
-            # VAD returned a result; adjust the frame number
-            frame = list(res.values())[0] - self.buffer_offset
-            if "start" in res and "end" not in res:
-                self.status = "voice"
-                send_audio = self.audio_buffer[frame:]
-                self.online.init(offset=(frame + self.buffer_offset) / self.SAMPLING_RATE)
-                self.online.insert_audio_chunk(send_audio)
-                self.current_online_chunk_buffer_size += len(send_audio)
-                self.clear_buffer()
-            elif "end" in res and "start" not in res:
-                self.status = "nonvoice"
-                send_audio = self.audio_buffer[:frame]
-                self.online.insert_audio_chunk(send_audio)
-                self.current_online_chunk_buffer_size += len(send_audio)
-                self.is_currently_final = True
-                self.clear_buffer()
-            else:
-                beg = res["start"] - self.buffer_offset
-                end = res["end"] - self.buffer_offset
-                self.status = "nonvoice"
-                send_audio = self.audio_buffer[beg:end]
-                self.online.init(offset=(beg + self.buffer_offset) / self.SAMPLING_RATE)
-                self.online.insert_audio_chunk(send_audio)
-                self.current_online_chunk_buffer_size += len(send_audio)
-                self.is_currently_final = True
-                self.clear_buffer()
+            try:
+                # VAD returned a result; adjust the frame number
+                frame = list(res.values())[0] - self.buffer_offset
+                if "start" in res and "end" not in res:
+                    self.status = "voice"
+                    send_audio = self.audio_buffer[frame:]
+                    self.online.init(offset=(frame + self.buffer_offset) / self.SAMPLING_RATE)
+                    self.online.insert_audio_chunk(send_audio)
+                    self.current_online_chunk_buffer_size += len(send_audio)
+                    self.clear_buffer()
+                elif "end" in res and "start" not in res:
+                    self.status = "nonvoice"
+                    send_audio = self.audio_buffer[:frame]
+                    self.online.insert_audio_chunk(send_audio)
+                    self.current_online_chunk_buffer_size += len(send_audio)
+                    self.is_currently_final = True
+                    self.clear_buffer()
+                else:
+                    beg = res["start"] - self.buffer_offset
+                    end = res["end"] - self.buffer_offset
+                    self.status = "nonvoice"
+                    send_audio = self.audio_buffer[beg:end]
+                    self.online.init(offset=(beg + self.buffer_offset) / self.SAMPLING_RATE)
+                    self.online.insert_audio_chunk(send_audio)
+                    self.current_online_chunk_buffer_size += len(send_audio)
+                    self.is_currently_final = True
+                    self.clear_buffer()
+            except Exception as e:
+                logger.error(f"Error in VAC processing: {e}")
+                # Fall back to regular processing on error
+                self.online.insert_audio_chunk(audio)
         else:
             if self.status == "voice":
                 self.online.insert_audio_chunk(self.audio_buffer)
@@ -460,13 +522,19 @@ class VACOnlineASRProcessor:
         Depending on the VAD status and the amount of accumulated audio,
         process the current audio chunk.
         """
-        if self.is_currently_final:
-            return self.finish()
-        elif self.current_online_chunk_buffer_size > self.SAMPLING_RATE * self.online_chunk_size:
-            self.current_online_chunk_buffer_size = 0
-            return self.online.process_iter()
-        else:
-            logger.debug("No online update, only VAD")
+        try:
+            if self.is_currently_final:
+                result = self.finish()
+                return result
+            elif self.current_online_chunk_buffer_size > self.SAMPLING_RATE * self.online_chunk_size:
+                self.current_online_chunk_buffer_size = 0
+                return self.online.process_iter()
+            else:
+                logger.debug("No online update, only VAD")
+                return Transcript(None, None, "")
+        except Exception as e:
+            logger.error(f"Error in VAC process_iter: {e}")
+            # Return empty transcript on error
             return Transcript(None, None, "")
 
     def finish(self) -> Transcript:
@@ -477,7 +545,5 @@ class VACOnlineASRProcessor:
         return result
     
     def get_buffer(self):
-        """
-        Get the unvalidated buffer in string format.
-        """
-        return self.online.concatenate_tokens(self.online.transcript_buffer.buffer).text
+        """Get the unvalidated buffer in string format."""
+        return self.online.get_buffer()

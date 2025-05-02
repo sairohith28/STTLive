@@ -105,36 +105,127 @@ class FasterWhisperASR(ASRBase):
             model_size_or_path = modelsize
         else:
             raise ValueError("Either modelsize or model_dir must be set")
-        device = "auto" # Allow CTranslate2 to decide available device
-        compute_type = "auto" # Allow CTranslate2 to decide faster compute type
+        
+        # Enhanced device detection and configuration
+        device = "cpu"
+        compute_type = "int8"
+        
+        if torch:
+            if torch.cuda.is_available():
+                device = "cuda"
+                compute_type = "float16"
+                torch.cuda.empty_cache()  # Clear CUDA memory before loading model
+                
+                # Check available GPU memory and adjust settings accordingly
+                try:
+                    free_memory = torch.cuda.mem_get_info()[0] / (1024**3)  # Convert to GB
+                    logger.info(f"Available GPU memory: {free_memory:.2f} GB")
+                    
+                    # For devices with limited memory, use int8 quantization
+                    if free_memory < 2.0 and "large" in str(model_size_or_path).lower():
+                        compute_type = "int8"
+                        logger.info(f"Using {compute_type} precision for {model_size_or_path} due to limited GPU memory")
+                    # For devices with 8+ GB memory, use float16 for better accuracy
+                    elif free_memory > 8.0:
+                        torch.backends.cudnn.benchmark = True  # Enable cudnn autotuner
+                        logger.info("Enabling CUDNN benchmark mode for faster processing")
+                except Exception as e:
+                    logger.warning(f"Could not check GPU memory: {e}, using default settings")
+            
+            elif hasattr(torch, 'mps') and torch.backends.mps.is_available():
+                device = "mps"
+                compute_type = "float16"
+                
+        # Optimize for model size and task
+        beam_size = 3  # Default
+        if "tiny" in str(model_size_or_path).lower() or "base" in str(model_size_or_path).lower():
+            beam_size = 2  # Faster for small models
+        elif "large" in str(model_size_or_path).lower():
+            beam_size = 4  # Better accuracy for large models
+        
+        # Advanced configuration with adaptive parameters
+        best_of = None  # Default from faster-whisper
+        if device == "cuda":
+            # Use more threads on GPU for parallel processing
+            cpu_threads = 2
+            # Use more workers for loading when GPU is available
+            num_workers = 3 if "large" not in str(model_size_or_path).lower() else 2
+        else:
+            # Use more CPU threads when running on CPU
+            cpu_threads = min(8, os.cpu_count() or 4)
+            num_workers = 1  # Fewer workers on CPU to avoid contention
+            
+        # Cache model parameters for future reference
+        self.device = device
+        self.compute_type = compute_type
+        self.beam_size = beam_size
                               
-
+        logger.info(f"Loading model on {device} with {compute_type} precision")
         model = WhisperModel(
             model_size_or_path,
             device=device,
             compute_type=compute_type,
             download_root=cache_dir,
+            cpu_threads=cpu_threads,
+            num_workers=num_workers,
+            local_files_only=False  # Allow downloading if needed
         )
         return model
 
     def transcribe(self, audio: np.ndarray, init_prompt: str = "") -> list:
+        # Optimize transcription parameters based on audio length
+        audio_length = len(audio) / 16000  # in seconds
+        
+        # Adjust beam size based on audio length for speed/accuracy tradeoff
+        adaptive_beam_size = self.beam_size
+        if audio_length > 15.0:  # For longer segments
+            adaptive_beam_size = max(2, self.beam_size - 1)  # Reduce beam size
+            
+        # For very short segments, we can use more aggressive settings
+        if audio_length < 2.0:
+            adaptive_beam_size = 1  # Fastest setting
+
+        # Optimize VAD parameters if enabled
+        vad_parameters = {}
+        if self.transcribe_kargs.get('vad_filter', False):
+            vad_parameters = {
+                'vad_filter': True,
+                'vad_parameters': {
+                    'min_silence_duration_ms': 300,  # Shorter silence detection
+                    'threshold': 0.45,  # Slightly more sensitive
+                }
+            }
+
+        # Apply optimized transcribe parameters
         segments, info = self.model.transcribe(
             audio,
             language=self.original_language,
             initial_prompt=init_prompt,
-            beam_size=5,
+            beam_size=adaptive_beam_size,
             word_timestamps=True,
             condition_on_previous_text=True,
-            **self.transcribe_kargs,
+            temperature=0.0,  # Use greedy decoding for consistency
+            compression_ratio_threshold=2.2,  # Slightly higher to filter out nonsense
+            log_prob_threshold=-0.8,  # Slightly higher to filter low confidence
+            no_speech_threshold=0.6,  # Slightly more aggressive
+            **vad_parameters,
+            **{k: v for k, v in self.transcribe_kargs.items() if k != 'vad_filter'}  # Other params
         )
         return list(segments)
 
     def ts_words(self, segments) -> List[ASRToken]:
         tokens = []
         for segment in segments:
-            if segment.no_speech_prob > 0.9:
+            # Skip segments with high no_speech probability
+            if segment.no_speech_prob > 0.85:  # More aggressive filtering
                 continue
+                
+            # Process words with confidence filtering for better accuracy
             for word in segment.words:
+                # Skip low-confidence words
+                if hasattr(word, 'probability') and word.probability < 0.4:
+                    continue
+                    
                 token = ASRToken(word.start, word.end, word.word, probability=word.probability)
                 tokens.append(token)
         return tokens

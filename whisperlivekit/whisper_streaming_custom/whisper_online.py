@@ -111,25 +111,58 @@ def backend_factory(args):
     return asr, tokenizer
 
 def online_factory(args, asr, tokenizer, logfile=sys.stderr):
-    if args.vac:
-        online = VACOnlineASRProcessor(
-            args.min_chunk_size,
-            asr,
-            tokenizer,
-            logfile=logfile,
-            buffer_trimming=(args.buffer_trimming, args.buffer_trimming_sec),
-            confidence_validation = args.confidence_validation
-        )
+    """
+    Creates and configures the appropriate ASR processor based on arguments.
+    
+    This function creates either a standard OnlineASRProcessor or a VAC-enabled
+    processor that uses Voice Activity Detection for improved performance.
+    """
+    # Configure buffer trimming settings for large models
+    if "large" in args.model.lower():
+        logger.info("Large model detected. Optimizing buffer management settings.")
+        # For large models, we want to be more aggressive with trimming to prevent OOM
+        buffer_trimming_sec = min(args.buffer_trimming_sec, 10.0)  # Cap at 10 seconds max
     else:
-        online = OnlineASRProcessor(
-            asr,
-            tokenizer,
-            logfile=logfile,
-            buffer_trimming=(args.buffer_trimming, args.buffer_trimming_sec),
-            confidence_validation = args.confidence_validation
+        buffer_trimming_sec = args.buffer_trimming_sec
+        
+    buffer_trimming = (args.buffer_trimming, buffer_trimming_sec)
+    
+    # Configure the processor with the appropriate settings
+    try:
+        if args.vac:
+            logger.info("Creating VAC-enabled processor with voice activity control")
+            from .online_asr import VACOnlineASRProcessor
+            min_chunk_size = max(0.25, args.min_chunk_size)  # Ensure minimum isn't too small
+            online = VACOnlineASRProcessor(
+                online_chunk_size=min_chunk_size,
+                asr=asr,
+                tokenize_method=tokenizer,
+                buffer_trimming=buffer_trimming,
+                confidence_validation=args.confidence_validation,
+                logfile=logfile
+            )
+        else:
+            logger.info("Creating standard online ASR processor")
+            from .online_asr import OnlineASRProcessor
+            online = OnlineASRProcessor(
+                asr=asr,
+                tokenize_method=tokenizer,
+                buffer_trimming=buffer_trimming,
+                confidence_validation=args.confidence_validation,
+                logfile=logfile
+            )
+        return online
+    except Exception as e:
+        logger.error(f"Failed to create ASR processor: {e}. Falling back to standard processor.")
+        from .online_asr import OnlineASRProcessor
+        return OnlineASRProcessor(
+            asr=asr,
+            tokenize_method=tokenizer,
+            buffer_trimming=buffer_trimming,
+            confidence_validation=args.confidence_validation,
+            logfile=logfile
         )
-    return online
-  
+
 def asr_factory(args, logfile=sys.stderr):
     """
     Creates and configures an ASR and ASR Online instance based on the specified backend and arguments.

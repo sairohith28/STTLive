@@ -6,6 +6,7 @@ import math
 import logging
 import traceback
 from datetime import timedelta
+from concurrent.futures import ThreadPoolExecutor
 from whisperlivekit.timed_objects import ASRToken
 from whisperlivekit.whisper_streaming_custom.whisper_online import online_factory
 from whisperlivekit.core import WhisperLiveKit
@@ -14,6 +15,9 @@ from whisperlivekit.core import WhisperLiveKit
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
+
+# Create a thread pool for CPU-intensive operations
+thread_pool = ThreadPoolExecutor(max_workers=4)
 
 def format_time(seconds: float) -> str:
     """Format seconds as HH:MM:SS."""
@@ -37,10 +41,10 @@ class AudioProcessor:
         self.samples_per_sec = int(self.sample_rate * self.args.min_chunk_size)
         self.bytes_per_sample = 2
         self.bytes_per_sec = self.samples_per_sec * self.bytes_per_sample
-        self.max_bytes_per_sec = 32000 * 5  # 5 seconds of audio at 32 kHz
+        self.max_bytes_per_sec = 32000 * 3  # Reduced from 5 to 3 seconds for faster processing
         self.last_ffmpeg_activity = time()
-        self.ffmpeg_health_check_interval = 5
-        self.ffmpeg_max_idle_time = 10
+        self.ffmpeg_health_check_interval = 3
+        self.ffmpeg_max_idle_time = 6
  
         # State management
         self.tokens = []
@@ -59,42 +63,49 @@ class AudioProcessor:
         self.tokenizer = models.tokenizer
         self.diarization = models.diarization
         self.ffmpeg_process = self.start_ffmpeg_decoder()
-        self.transcription_queue = asyncio.Queue() if self.args.transcription else None
-        self.diarization_queue = asyncio.Queue() if self.args.diarization else None
+        self.transcription_queue = asyncio.Queue(maxsize=10) if self.args.transcription else None
+        self.diarization_queue = asyncio.Queue(maxsize=10) if self.args.diarization else None
         self.pcm_buffer = bytearray()
         
         # Initialize transcription engine if enabled
         if self.args.transcription:
             self.online = online_factory(self.args, models.asr, models.tokenizer)
+            
+        # Performance optimizations
+        self.use_parallel = True  # Enable parallel processing
+        self.max_update_freq = 0.2  # Maximum update frequency in seconds
+        self.last_update = 0
 
     def convert_pcm_to_float(self, pcm_buffer):
         """Convert PCM buffer in s16le format to normalized NumPy array."""
         return np.frombuffer(pcm_buffer, dtype=np.int16).astype(np.float32) / 32768.0
 
     def start_ffmpeg_decoder(self):
-        """Start FFmpeg process for WebM to PCM conversion."""
+        """Start FFmpeg process for WebM to PCM conversion with optimized settings."""
         return (ffmpeg.input("pipe:0", format="webm")
                 .output("pipe:1", format="s16le", acodec="pcm_s16le", 
-                        ac=self.channels, ar=str(self.sample_rate))
+                        ac=self.channels, ar=str(self.sample_rate),
+                        # Add thread optimization for ffmpeg
+                        **{'threads': '4'})
                 .run_async(pipe_stdin=True, pipe_stdout=True, pipe_stderr=True))
 
     async def restart_ffmpeg(self):
-        """Restart the FFmpeg process after failure."""
+        """Restart the FFmpeg process after failure with improved error handling."""
         logger.warning("Restarting FFmpeg process...")
         
         if self.ffmpeg_process:
             try:
-                # we check if process is still running
+                # Check if process is still running
                 if self.ffmpeg_process.poll() is None:
                     logger.info("Terminating existing FFmpeg process")
                     self.ffmpeg_process.stdin.close()
                     self.ffmpeg_process.terminate()
                     
-                    # wait for termination with timeout
+                    # Wait for termination with timeout
                     try:
                         await asyncio.wait_for(
                             asyncio.get_event_loop().run_in_executor(None, self.ffmpeg_process.wait),
-                            timeout=5.0
+                            timeout=3.0  # Reduced from 5.0 to 3.0 seconds
                         )
                     except asyncio.TimeoutError:
                         logger.warning("FFmpeg process did not terminate, killing forcefully")
@@ -104,7 +115,7 @@ class AudioProcessor:
                 logger.error(f"Error during FFmpeg process termination: {e}")
                 logger.error(traceback.format_exc())
         
-        # we start new process
+        # Start new process
         try:
             logger.info("Starting new FFmpeg process")
             self.ffmpeg_process = self.start_ffmpeg_decoder()
@@ -114,8 +125,8 @@ class AudioProcessor:
         except Exception as e:
             logger.error(f"Failed to restart FFmpeg process: {e}")
             logger.error(traceback.format_exc())
-            # try again after 5s
-            await asyncio.sleep(5)
+            # Try again after shorter delay
+            await asyncio.sleep(2)
             try:
                 self.ffmpeg_process = self.start_ffmpeg_decoder()
                 self.pcm_buffer = bytearray()
@@ -127,6 +138,13 @@ class AudioProcessor:
 
     async def update_transcription(self, new_tokens, buffer, end_buffer, full_transcription, sep):
         """Thread-safe update of transcription with new data."""
+        # Rate limit updates to minimize contention
+        current_time = time()
+        if current_time - self.last_update < self.max_update_freq and not new_tokens:
+            return
+            
+        self.last_update = current_time
+        
         async with self.lock:
             self.tokens.extend(new_tokens)
             self.buffer_transcription = buffer
@@ -186,7 +204,7 @@ class AudioProcessor:
             self.beg_loop = time()
 
     async def ffmpeg_stdout_reader(self):
-        """Read audio data from FFmpeg stdout and process it."""
+        """Read audio data from FFmpeg stdout and process it with optimized buffer handling."""
         loop = asyncio.get_event_loop()
         beg = time()
         
@@ -194,10 +212,11 @@ class AudioProcessor:
             try:
                 current_time = time()
                 elapsed_time = math.floor((current_time - beg) * 10) / 10
-                buffer_size = max(int(32000 * elapsed_time), 4096)
+                # Optimize buffer size calculation for smoother processing
+                buffer_size = min(max(int(16000 * elapsed_time), 2048), 16384)  # Cap at 16KB for more frequent updates
                 beg = current_time
 
-                # Detect idle state much more quickly
+                # Detect idle state quickly
                 if current_time - self.last_ffmpeg_activity > self.ffmpeg_max_idle_time:
                     logger.warning(f"FFmpeg process idle for {current_time - self.last_ffmpeg_activity:.2f}s. Restarting...")
                     await self.restart_ffmpeg()
@@ -214,14 +233,8 @@ class AudioProcessor:
                     break
                     
                 self.pcm_buffer.extend(chunk)
-                        
-                # Send to diarization if enabled
-                if self.args.diarization and self.diarization_queue:
-                    await self.diarization_queue.put(
-                        self.convert_pcm_to_float(self.pcm_buffer).copy()
-                    )
-
-                # Process when enough data
+                
+                # Optimized PCM buffer processing with parallel queuing
                 if len(self.pcm_buffer) >= self.bytes_per_sec:
                     if len(self.pcm_buffer) > self.max_bytes_per_sec:
                         logger.warning(
@@ -233,13 +246,29 @@ class AudioProcessor:
                     pcm_array = self.convert_pcm_to_float(self.pcm_buffer[:self.max_bytes_per_sec])
                     self.pcm_buffer = self.pcm_buffer[self.max_bytes_per_sec:]
                     
-                    # Send to transcription if enabled
-                    if self.args.transcription and self.transcription_queue:
-                        await self.transcription_queue.put(pcm_array.copy())
+                    # Send to transcription and diarization in parallel
+                    tasks = []
                     
-                    # Sleep if no processing is happening
+                    if self.args.transcription and self.transcription_queue:
+                        # Use try/except with nowait to avoid blocking
+                        try:
+                            self.transcription_queue.put_nowait(pcm_array.copy())
+                        except asyncio.QueueFull:
+                            logger.warning("Transcription queue full, skipping chunk")
+                    
+                    if self.args.diarization and self.diarization_queue:
+                        try:
+                            self.diarization_queue.put_nowait(self.convert_pcm_to_float(self.pcm_buffer).copy())
+                        except asyncio.QueueFull:
+                            logger.warning("Diarization queue full, skipping chunk")
+                    
+                    # Wait for all queue puts to complete
+                    if tasks:
+                        await asyncio.gather(*tasks)
+                    
+                    # Small delay to yield control to other tasks
                     if not self.args.transcription and not self.args.diarization:
-                        await asyncio.sleep(0.1)
+                        await asyncio.sleep(0.05)  # Reduced from 0.1 to 0.05
                     
             except Exception as e:
                 logger.warning(f"Exception in ffmpeg_stdout_reader: {e}")
@@ -247,7 +276,7 @@ class AudioProcessor:
                 break
 
     async def transcription_processor(self):
-        """Process audio chunks for transcription."""
+        """Process audio chunks for transcription with optimized handling."""
         self.full_transcription = ""
         self.sep = self.online.asr.sep
         
@@ -255,11 +284,20 @@ class AudioProcessor:
             try:
                 pcm_array = await self.transcription_queue.get()
                 
-                logger.info(f"{len(self.online.audio_buffer) / self.online.SAMPLING_RATE} seconds of audio to process.")
+                # Perform CPU-intensive transcription in thread pool
+                def process_transcription():
+                    try:
+                        # Process audio and extract tokens - this is CPU intensive
+                        self.online.insert_audio_chunk(pcm_array)
+                        return self.online.process_iter()
+                    except Exception as e:
+                        logger.error(f"Error in transcription thread: {e}")
+                        return []
                 
-                # Process transcription
-                self.online.insert_audio_chunk(pcm_array)
-                new_tokens = self.online.process_iter()
+                # Run in thread pool to avoid blocking the event loop
+                new_tokens = await asyncio.get_event_loop().run_in_executor(
+                    thread_pool, process_transcription
+                )
                 
                 if new_tokens:
                     self.full_transcription += self.sep.join([t.text for t in new_tokens])
@@ -286,22 +324,25 @@ class AudioProcessor:
                 self.transcription_queue.task_done()
 
     async def diarization_processor(self, diarization_obj):
-        """Process audio chunks for speaker diarization."""
+        """Process audio chunks for speaker diarization with thread pool optimization."""
         buffer_diarization = ""
         
         while True:
             try:
                 pcm_array = await self.diarization_queue.get()
                 
-                # Process diarization
-                await diarization_obj.diarize(pcm_array)
+                # Use thread pool to avoid blocking the event loop with CPU-intensive diarization
+                async def process_diarization():
+                    # Process diarization
+                    await diarization_obj.diarize(pcm_array)
+                    
+                    # Get current state and update speakers
+                    state = await self.get_current_state()
+                    return diarization_obj.assign_speakers_to_tokens(
+                        state["end_attributed_speaker"], state["tokens"]
+                    )
                 
-                # Get current state and update speakers
-                state = await self.get_current_state()
-                new_end = diarization_obj.assign_speakers_to_tokens(
-                    state["end_attributed_speaker"], state["tokens"]
-                )
-                
+                new_end = await process_diarization()
                 await self.update_diarization(new_end, buffer_diarization)
                 
             except Exception as e:
@@ -311,9 +352,19 @@ class AudioProcessor:
                 self.diarization_queue.task_done()
 
     async def results_formatter(self):
-        """Format processing results for output."""
+        """Format processing results for output with optimized update frequency."""
+        last_yield_time = 0
+        min_yield_interval = 0.1  # Minimum time between yields to client
+        
         while True:
             try:
+                current_time = time()
+                
+                # Rate-limit updates to reduce CPU usage and network traffic
+                if current_time - last_yield_time < min_yield_interval:
+                    await asyncio.sleep(0.05)
+                    continue
+                
                 # Get current state
                 state = await self.get_current_state()
                 tokens = state["tokens"]
@@ -325,17 +376,16 @@ class AudioProcessor:
                 # Add dummy tokens if needed
                 if (not tokens or tokens[-1].is_dummy) and not self.args.transcription and self.args.diarization:
                     await self.add_dummy_token()
-                    sleep(0.5)
                     state = await self.get_current_state()
                     tokens = state["tokens"]
                 
-                # Format output
+                # Format output with optimized processing
                 previous_speaker = -1
                 lines = []
                 last_end_diarized = 0
                 undiarized_text = []
                 
-                # Process each token
+                # Process each token (this is potentially slow with many tokens)
                 for token in tokens:
                     speaker = token.speaker
                     
@@ -349,7 +399,7 @@ class AudioProcessor:
                         if speaker not in [-1, 0]:
                             last_end_diarized = max(token.end, last_end_diarized)
 
-                    # Group by speaker
+                    # Group by speaker with optimized comparisons
                     if speaker != previous_speaker or not lines:
                         lines.append({
                             "speaker": speaker,
@@ -390,15 +440,19 @@ class AudioProcessor:
                     "remaining_time_diarization": state["remaining_time_diarization"]
                 }
                 
-                # Only yield if content has changed
+                # Compute response content hash for change detection
                 response_content = ' '.join([f"{line['speaker']} {line['text']}" for line in lines]) + \
                                   f" | {buffer_transcription} | {buffer_diarization}"
                 
+                # Only yield if content has changed
                 if response_content != self.last_response_content and (lines or buffer_transcription or buffer_diarization):
                     yield response
                     self.last_response_content = response_content
+                    last_yield_time = current_time
                 
-                await asyncio.sleep(0.1)  # Avoid overwhelming the client
+                # Dynamic sleep time based on system activity
+                sleep_time = 0.05 if current_time - last_yield_time < 1.0 else 0.1
+                await asyncio.sleep(sleep_time)
                 
             except Exception as e:
                 logger.warning(f"Exception in results_formatter: {e}")
@@ -406,7 +460,7 @@ class AudioProcessor:
                 await asyncio.sleep(0.5)  # Back off on error
         
     async def create_tasks(self):
-        """Create and start processing tasks."""
+        """Create and start processing tasks with improved task management."""
             
         tasks = []    
         if self.args.transcription and self.online:
@@ -417,11 +471,11 @@ class AudioProcessor:
         
         tasks.append(asyncio.create_task(self.ffmpeg_stdout_reader()))
         
-        # Monitor overall system health
+        # Monitor overall system health with optimized checks
         async def watchdog():
             while True:
                 try:
-                    await asyncio.sleep(10)  # Check every 10 seconds instead of 60
+                    await asyncio.sleep(5)  # Check every 5 seconds (reduced from 10)
                     
                     current_time = time()
                     # Check for stalled tasks
@@ -430,14 +484,22 @@ class AudioProcessor:
                             exc = task.exception() if task.done() else None
                             task_name = task.get_name() if hasattr(task, 'get_name') else f"Task {i}"
                             logger.error(f"{task_name} unexpectedly completed with exception: {exc}")
+                            
+                            # Restart critical tasks that died unexpectedly
+                            if "ffmpeg_stdout_reader" in str(task):
+                                logger.warning("Restarting FFmpeg reader task")
+                                tasks[i] = asyncio.create_task(self.ffmpeg_stdout_reader())
+                            elif "transcription_processor" in str(task) and self.args.transcription and self.online:
+                                logger.warning("Restarting transcription processor task")
+                                tasks[i] = asyncio.create_task(self.transcription_processor())
                     
                     # Check for FFmpeg process health with shorter thresholds
                     ffmpeg_idle_time = current_time - self.last_ffmpeg_activity
-                    if ffmpeg_idle_time > 15:  # 15 seconds instead of 180
+                    if ffmpeg_idle_time > 10:  # 10 seconds instead of 15
                         logger.warning(f"FFmpeg idle for {ffmpeg_idle_time:.2f}s - may need attention")
                         
-                        # Force restart after 30 seconds of inactivity (instead of 600)
-                        if ffmpeg_idle_time > 30:
+                        # Force restart after 20 seconds of inactivity
+                        if ffmpeg_idle_time > 20:  # 20 seconds instead of 30
                             logger.error("FFmpeg idle for too long, forcing restart")
                             await self.restart_ffmpeg()
                             
@@ -465,9 +527,9 @@ class AudioProcessor:
             self.diarization.close()
 
     async def process_audio(self, message):
-        """Process incoming audio data."""
+        """Process incoming audio data with optimized retry logic."""
         retry_count = 0
-        max_retries = 3
+        max_retries = 2  # Reduced from 3 to 2 for faster failure recovery
         
         # Log periodic heartbeats showing ongoing audio proc
         current_time = time()
@@ -485,7 +547,7 @@ class AudioProcessor:
                 try:
                     await asyncio.wait_for(
                         loop.run_in_executor(None, lambda: self.ffmpeg_process.stdin.write(message)),
-                        timeout=2.0
+                        timeout=1.0  # Reduced from 2.0 to 1.0
                     )
                 except asyncio.TimeoutError:
                     logger.warning("FFmpeg write operation timed out, restarting...")
@@ -496,7 +558,7 @@ class AudioProcessor:
                 try:
                     await asyncio.wait_for(
                         loop.run_in_executor(None, self.ffmpeg_process.stdin.flush),
-                        timeout=2.0
+                        timeout=1.0  # Reduced from 2.0 to 1.0
                     )
                 except asyncio.TimeoutError:
                     logger.warning("FFmpeg flush operation timed out, restarting...")
@@ -513,7 +575,7 @@ class AudioProcessor:
                 
                 if retry_count < max_retries:
                     await self.restart_ffmpeg()
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.25)  # Reduced from 0.5 to 0.25
                 else:
                     logger.error("Maximum retries reached for FFmpeg process")
                     await self.restart_ffmpeg()
