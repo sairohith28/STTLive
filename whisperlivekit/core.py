@@ -3,6 +3,242 @@ try:
 except ImportError:
     from .whisper_streaming_custom.whisper_online import backend_factory, warmup_asr
 from argparse import Namespace, ArgumentParser
+import asyncio
+import logging
+import numpy as np
+import time
+import threading
+from typing import Dict, List, Optional, Tuple, Any
+from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+from whisperlivekit.timed_objects import ASRToken
+
+logger = logging.getLogger(__name__)
+
+# Create a thread pool for CPU-intensive operations - shared across all instances
+_global_thread_pool = ThreadPoolExecutor(max_workers=4)
+
+class BatchTranscriptionRequest:
+    """Represents a request for batch transcription processing"""
+    
+    def __init__(self, client_id: str, audio_data: np.ndarray, request_time: float):
+        self.client_id = client_id
+        self.audio_data = audio_data  
+        self.request_time = request_time
+        self.processing_complete = asyncio.Event()
+        self.result = None
+        
+    def set_result(self, result):
+        """Set the result and mark the request as complete"""
+        self.result = result
+        self.processing_complete.set()
+
+class BatchTranscriptionService:
+    """Manages batched transcription requests for multiple clients using a single model"""
+    
+    _instance = None
+    
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+    
+    def __init__(self, asr=None, tokenizer=None, batch_size=8, max_wait_time=0.1):
+        """Initialize the batch processing service with shared model"""
+        if hasattr(self, '_initialized') and self._initialized:
+            return
+            
+        self.asr = asr
+        self.tokenizer = tokenizer
+        self.batch_size = batch_size  # Maximum batch size
+        self.max_wait_time = max_wait_time  # Maximum time to wait before processing
+        
+        # Request management
+        self.pending_requests = asyncio.Queue()
+        self.client_buffers: Dict[str, List[np.ndarray]] = {}
+        self.client_last_request: Dict[str, float] = {}
+        self.current_batch: List[BatchTranscriptionRequest] = []
+        
+        # Performance metrics
+        self.total_processed = 0
+        self.batch_sizes = []
+        self.processing_times = []
+        
+        # Batch processing task
+        self.is_running = True
+        self.processing_task = None
+        self._initialized = True
+        
+        # Start the background task if asr is available
+        if self.asr:
+            self.start()
+    
+    def start(self):
+        """Start the batch processing background task"""
+        if not self.processing_task:
+            self.processing_task = asyncio.create_task(self._process_batches())
+            logger.info("Batch transcription service started")
+    
+    async def stop(self):
+        """Stop the batch processing background task"""
+        if self.processing_task:
+            self.is_running = False
+            await self.pending_requests.put(None)  # Signal termination
+            await self.processing_task
+            self.processing_task = None
+            logger.info("Batch transcription service stopped")
+    
+    async def submit(self, client_id: str, audio_data: np.ndarray) -> Any:
+        """Submit audio data for batch processing and wait for results"""
+        if not self.asr:
+            raise ValueError("No ASR model available for transcription")
+            
+        # Create a request
+        request = BatchTranscriptionRequest(
+            client_id=client_id, 
+            audio_data=audio_data,
+            request_time=time.time()
+        )
+        
+        # Submit to queue
+        await self.pending_requests.put(request)
+        
+        # Wait for processing to complete
+        await request.processing_complete.wait()
+        return request.result
+    
+    async def _process_batches(self):
+        """Background task that processes batches of requests"""
+        while self.is_running:
+            try:
+                # Initialize current batch
+                self.current_batch = []
+                batch_start_time = time.time()
+                
+                # Get at least one request to process
+                request = await self.pending_requests.get()
+                if request is None:  # Stop signal
+                    break
+                    
+                self.current_batch.append(request)
+                
+                # Try to batch more requests if available
+                max_wait_end_time = time.time() + self.max_wait_time
+                while (len(self.current_batch) < self.batch_size and 
+                       time.time() < max_wait_end_time):
+                    try:
+                        # Non-blocking get with timeout
+                        next_request = await asyncio.wait_for(
+                            self.pending_requests.get(), 
+                            timeout=max(0, max_wait_end_time - time.time())
+                        )
+                        if next_request is None:  # Stop signal
+                            break
+                        self.current_batch.append(next_request)
+                    except asyncio.TimeoutError:
+                        break
+                
+                # Exit if we received stop signal
+                if None in self.current_batch:
+                    self.current_batch.remove(None)
+                    break
+                
+                if not self.current_batch:
+                    continue
+                
+                # Process the batch
+                batch_size = len(self.current_batch)
+                logger.debug(f"Processing batch of {batch_size} requests")
+                self.batch_sizes.append(batch_size)
+                
+                process_start = time.time()
+                
+                # Run transcription in thread pool to avoid blocking the event loop
+                results = await self._process_transcription_batch()
+                
+                # Record processing time
+                process_time = time.time() - process_start
+                self.processing_times.append(process_time)
+                self.total_processed += batch_size
+                
+                # Return results to clients
+                for req, result in zip(self.current_batch, results):
+                    req.set_result(result)
+                    
+                # Log performance metrics periodically
+                if self.total_processed % 50 == 0:
+                    avg_batch = sum(self.batch_sizes[-50:]) / len(self.batch_sizes[-50:])
+                    avg_time = sum(self.processing_times[-50:]) / len(self.processing_times[-50:])
+                    logger.info(f"Transcription stats: avg batch size={avg_batch:.2f}, " 
+                               f"avg process time={avg_time:.4f}s, total processed={self.total_processed}")
+                    
+            except Exception as e:
+                logger.error(f"Error in batch processing: {e}")
+                # Return error to clients waiting in current batch
+                for req in self.current_batch:
+                    req.set_result({"error": str(e)})
+                    
+    async def _process_transcription_batch(self) -> List[Any]:
+        """Process a batch of transcription requests using the model"""
+        if not self.current_batch:
+            return []
+            
+        # For single request, process directly
+        if len(self.current_batch) == 1:
+            req = self.current_batch[0]
+            return [await self._transcribe_single(req.audio_data)]
+            
+        # For multiple requests, batch process if backend supports it
+        loop = asyncio.get_event_loop()
+        
+        # Process using thread pool to avoid blocking
+        try:
+            # Create a list of audio data from all requests
+            audio_batch = [req.audio_data for req in self.current_batch]
+            
+            # Process using FasterWhisperASR's batch processing if available
+            if hasattr(self.asr, "transcribe_batch"):
+                logger.debug(f"Using native batch transcription for {len(audio_batch)} samples")
+                batch_results = await loop.run_in_executor(
+                    _global_thread_pool, 
+                    lambda: self.asr.transcribe_batch(audio_batch)
+                )
+                return batch_results
+            else:
+                # Fall back to sequential processing if batching not supported
+                logger.debug(f"Using sequential processing for {len(audio_batch)} samples")
+                results = []
+                for audio in audio_batch:
+                    result = await self._transcribe_single(audio)
+                    results.append(result)
+                return results
+                
+        except Exception as e:
+            logger.error(f"Error in batch transcription: {e}")
+            return [{"error": str(e)}] * len(self.current_batch)
+    
+    async def _transcribe_single(self, audio_data: np.ndarray) -> Any:
+        """Process a single transcription request"""
+        loop = asyncio.get_event_loop()
+        try:
+            # Process in thread pool
+            segments = await loop.run_in_executor(
+                _global_thread_pool,
+                lambda: self.asr.transcribe(audio_data)
+            )
+            
+            # Extract word timestamps
+            tokens = await loop.run_in_executor(
+                _global_thread_pool,
+                lambda: self.asr.ts_words(segments)
+            )
+            
+            return {"segments": segments, "tokens": tokens}
+            
+        except Exception as e:
+            logger.error(f"Error in single transcription: {e}")
+            return {"error": str(e)}
 
 def parse_args():
     parser = ArgumentParser(description="Whisper FastAPI Online Server")
@@ -165,10 +401,36 @@ class WhisperLiveKit:
         self.asr = None
         self.tokenizer = None
         self.diarization = None
+        self.batch_service = None
         
         if self.args.transcription:
             self.asr, self.tokenizer = backend_factory(self.args)
             warmup_asr(self.asr, self.args.warmup_file)
+            
+            # Initialize batch transcription service with optimal batch size for A100
+            # For large models like distil-whisper-v3 on A100, we can use larger batch sizes
+            optimal_batch_size = 16
+            if "large" in self.args.model or "distil" in self.args.model:
+                if hasattr(self.asr, "device") and self.asr.device == "cuda":
+                    # For A100 with 80GB, we can use larger batches
+                    try:
+                        import torch
+                        if torch.cuda.is_available():
+                            gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                            if gpu_mem > 40:  # For A100 40GB+
+                                optimal_batch_size = 24
+                            if gpu_mem > 80:  # For A100 80GB+
+                                optimal_batch_size = 32
+                            logger.info(f"Detected {gpu_mem:.1f}GB GPU memory, setting batch size to {optimal_batch_size}")
+                    except Exception as e:
+                        logger.warning(f"Could not detect GPU memory: {e}, using default batch size {optimal_batch_size}")
+            
+            self.batch_service = BatchTranscriptionService(
+                asr=self.asr,
+                tokenizer=self.tokenizer,
+                batch_size=optimal_batch_size,
+                max_wait_time=0.1  # 100ms max wait time for batch collection
+            )
 
         if self.args.diarization:
             from whisperlivekit.diarization.diarization_online import DiartDiarization

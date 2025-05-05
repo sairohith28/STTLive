@@ -96,6 +96,7 @@ class FasterWhisperASR(ASRBase):
 
     def load_model(self, modelsize=None, cache_dir=None, model_dir=None):
         from faster_whisper import WhisperModel
+        import os
 
         if model_dir is not None:
             logger.debug(f"Loading whisper model from model_dir {model_dir}. "
@@ -119,16 +120,18 @@ class FasterWhisperASR(ASRBase):
                 # Check available GPU memory and adjust settings accordingly
                 try:
                     free_memory = torch.cuda.mem_get_info()[0] / (1024**3)  # Convert to GB
-                    logger.info(f"Available GPU memory: {free_memory:.2f} GB")
+                    total_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                    logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
+                    logger.info(f"Available GPU memory: {free_memory:.2f}GB of {total_memory:.2f}GB total")
                     
+                    # For high-end GPUs like A100, use float16 for accuracy 
+                    if total_memory >= 40:  # A100 40GB+
+                        compute_type = "float16"
+                        logger.info(f"Using {compute_type} precision on high-memory GPU")
                     # For devices with limited memory, use int8 quantization
-                    if free_memory < 2.0 and "large" in str(model_size_or_path).lower():
+                    elif free_memory < 2.0 and "large" in str(model_size_or_path).lower():
                         compute_type = "int8"
                         logger.info(f"Using {compute_type} precision for {model_size_or_path} due to limited GPU memory")
-                    # For devices with 8+ GB memory, use float16 for better accuracy
-                    elif free_memory > 8.0:
-                        torch.backends.cudnn.benchmark = True  # Enable cudnn autotuner
-                        logger.info("Enabling CUDNN benchmark mode for faster processing")
                 except Exception as e:
                     logger.warning(f"Could not check GPU memory: {e}, using default settings")
             
@@ -140,7 +143,7 @@ class FasterWhisperASR(ASRBase):
         beam_size = 3  # Default
         if "tiny" in str(model_size_or_path).lower() or "base" in str(model_size_or_path).lower():
             beam_size = 2  # Faster for small models
-        elif "large" in str(model_size_or_path).lower():
+        elif "large" in str(model_size_or_path).lower() or "distil" in str(model_size_or_path).lower():
             beam_size = 4  # Better accuracy for large models
         
         # Advanced configuration with adaptive parameters
@@ -159,6 +162,13 @@ class FasterWhisperASR(ASRBase):
         self.device = device
         self.compute_type = compute_type
         self.beam_size = beam_size
+        self.model_size = model_size_or_path
+        
+        # Memory cleanup
+        import gc
+        gc.collect()
+        if torch and torch.cuda.is_available():
+            torch.cuda.empty_cache()
                               
         logger.info(f"Loading model on {device} with {compute_type} precision")
         model = WhisperModel(
@@ -212,18 +222,134 @@ class FasterWhisperASR(ASRBase):
             **{k: v for k, v in self.transcribe_kargs.items() if k != 'vad_filter'}  # Other params
         )
         return list(segments)
+    
+    def transcribe_with_params(self, audio: np.ndarray, init_prompt: str = "", **kwargs) -> list:
+        """
+        Transcribe with custom parameters for dynamic optimization.
+        This allows for runtime parameter adjustments to reduce lag during long sessions.
+        """
+        # Set base parameters
+        beam_size = kwargs.get('beam_size', self.beam_size)
+        vad_filter = kwargs.get('vad_filter', self.transcribe_kargs.get('vad_filter', False))
+        
+        # Build VAD parameters
+        vad_parameters = {}
+        if vad_filter:
+            vad_parameters = {
+                'vad_filter': True,
+                'vad_parameters': {
+                    'min_silence_duration_ms': 300,
+                    'threshold': 0.45,
+                }
+            }
+            
+        # Apply optimized transcribe parameters with custom overrides
+        segments, info = self.model.transcribe(
+            audio,
+            language=self.original_language,
+            initial_prompt=init_prompt,
+            beam_size=beam_size,
+            word_timestamps=True,
+            condition_on_previous_text=kwargs.get('condition_on_previous_text', True),
+            temperature=kwargs.get('temperature', 0.0),
+            compression_ratio_threshold=kwargs.get('compression_ratio_threshold', 2.2),
+            log_prob_threshold=kwargs.get('log_prob_threshold', -0.8),
+            no_speech_threshold=kwargs.get('no_speech_threshold', 0.6),
+            **vad_parameters,
+            **{k: v for k, v in self.transcribe_kargs.items() 
+               if k != 'vad_filter' and k not in kwargs}
+        )
+        
+        # Force memory cleanup for long running sessions
+        if torch and torch.cuda.is_available() and self.device == "cuda":
+            # Only run garbage collection every 10 calls to avoid overhead
+            if not hasattr(self, '_gc_counter'):
+                self._gc_counter = 0
+            self._gc_counter += 1
+            
+            if self._gc_counter % 10 == 0:
+                torch.cuda.empty_cache()
+                
+        return list(segments)
+        
+    def transcribe_batch(self, audio_batch: list) -> list:
+        """Process a batch of audio samples efficiently using a single model.
+        
+        This method is optimized for A100 GPUs and large models like distil-whisper-v3.
+        """
+        if not torch or not torch.cuda.is_available() or self.device != "cuda":
+            logger.warning("Batch processing requires CUDA. Falling back to sequential processing.")
+            return [self.transcribe(audio) for audio in audio_batch]
+            
+        batch_size = len(audio_batch)
+        results = []
+        
+        try:
+            # Process in smaller sub-batches if needed for very large batches
+            max_sub_batch = 16
+            
+            # For A100 with 40GB+, we can handle larger sub-batches
+            if torch.cuda.get_device_properties(0).total_memory > 40 * (1024**3):
+                max_sub_batch = 24
+            
+            # For distil-whisper-v3 on A100 80GB+, we can go even larger
+            if "distil" in str(self.model_size).lower() and torch.cuda.get_device_properties(0).total_memory > 80 * (1024**3):
+                max_sub_batch = 32
+                
+            logger.debug(f"Processing batch of {batch_size} audio samples with max sub-batch size {max_sub_batch}")
+            
+            # Process in sub-batches
+            for i in range(0, batch_size, max_sub_batch):
+                sub_batch = audio_batch[i:i+max_sub_batch]
+                sub_results = []
+                
+                # Use speed-optimized parameters for batch processing to reduce lag
+                beam_size = 1  # Use fastest beam size for batches
+                
+                # Use common parameters for all samples in the batch
+                for audio in sub_batch:
+                    audio_length = len(audio) / 16000
+                    # Even more simplified processing for batches to reduce lag
+                    if audio_length > 10.0:
+                        # Use fastest settings for long audio in batches
+                        segments = self.transcribe_with_params(
+                            audio, 
+                            beam_size=1,
+                            condition_on_previous_text=False,  # Faster processing
+                            temperature=0.0
+                        )
+                    else:
+                        segments = self.transcribe(audio)
+                        
+                    sub_results.append({
+                        "segments": segments,
+                        "tokens": self.ts_words(segments)
+                    })
+                    
+                results.extend(sub_results)
+                
+                # Clean up GPU memory after each sub-batch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    
+            return results
+                
+        except Exception as e:
+            logger.error(f"Error in batch transcription: {e}")
+            # Fall back to sequential processing
+            return [{"error": str(e), "segments": [], "tokens": []}] * batch_size
 
     def ts_words(self, segments) -> List[ASRToken]:
         tokens = []
         for segment in segments:
             # Skip segments with high no_speech probability
-            if segment.no_speech_prob > 0.85:  # More aggressive filtering
+            if hasattr(segment, 'no_speech_prob') and segment.no_speech_prob > 0.85:  # More aggressive filtering
                 continue
                 
             # Process words with confidence filtering for better accuracy
             for word in segment.words:
                 # Skip low-confidence words
-                if hasattr(word, 'probability') and word.probability < 0.4:
+                if hasattr(word, 'probability') and word.probability < 0.25:  # Reduced threshold to retain more words
                     continue
                     
                 token = ASRToken(word.start, word.end, word.word, probability=word.probability)

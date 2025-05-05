@@ -1,6 +1,7 @@
 import sys
 import numpy as np
 import logging
+import time
 from typing import List, Tuple, Optional
 from whisperlivekit.timed_objects import ASRToken, Sentence, Transcript
 
@@ -126,7 +127,12 @@ class OnlineASRProcessor:
         self.init()
 
         self.buffer_trimming_way, self.buffer_trimming_sec = buffer_trimming
-
+        
+        # Add buffer monitoring to prevent excessive growth
+        self.last_trim_time = time.time()
+        self.force_trim_interval = 8.0  # Force trimming every 8 seconds to prevent lag
+        self.max_buffer_size = self.SAMPLING_RATE * 20  # Maximum 20 seconds of audio to prevent OOM
+        
         if self.buffer_trimming_way not in ["sentence", "segment"]:
             raise ValueError("buffer_trimming must be either 'sentence' or 'segment'")
         if self.buffer_trimming_sec <= 0:
@@ -135,6 +141,14 @@ class OnlineASRProcessor:
             logger.warning(
                 f"buffer_trimming_sec is set to {self.buffer_trimming_sec}, which is very long. It may cause OOM."
             )
+        
+        # Adjust buffer trimming based on model size for better experience
+        if hasattr(asr, 'model_size') and asr.model_size:
+            model_size = str(asr.model_size).lower()
+            if "large" in model_size or "distil" in model_size:
+                # Use more aggressive trimming for large models
+                self.buffer_trimming_sec = min(self.buffer_trimming_sec, 10.0)
+                logger.info(f"Large model detected, adjusted buffer trimming to {self.buffer_trimming_sec}s")
 
     def init(self, offset: Optional[float] = None):
         """Initialize or reset the processing buffers."""
@@ -143,33 +157,35 @@ class OnlineASRProcessor:
         self.buffer_time_offset = offset if offset is not None else 0.0
         self.transcript_buffer.last_committed_time = self.buffer_time_offset
         self.committed: List[ASRToken] = []
+        self.last_trim_time = time.time()
 
     def insert_audio_chunk(self, audio: np.ndarray):
         """Append an audio chunk (a numpy array) to the current audio buffer."""
         self.audio_buffer = np.append(self.audio_buffer, audio)
-
+        
+        # Enforce maximum buffer size to prevent unbounded growth
+        current_buffer_size = len(self.audio_buffer)
+        if current_buffer_size > self.max_buffer_size:
+            # Cut to half of max size to avoid frequent trimming
+            excess = current_buffer_size - (self.max_buffer_size // 2)
+            cutoff_time = excess / self.SAMPLING_RATE
+            self.buffer_time_offset += cutoff_time
+            self.audio_buffer = self.audio_buffer[excess:]
+            logger.warning(f"Buffer exceeded maximum size, trimmed {cutoff_time:.2f}s from beginning")
+    
     def prompt(self) -> Tuple[str, str]:
         """
-        Returns a tuple: (prompt, context), where:
-          - prompt is a 200-character suffix of committed text that falls 
-            outside the current audio buffer.
-          - context is the committed text within the current audio buffer.
+        Get a prompt for the transcription (common transcription prefix).
+        Returns a tuple (prompt_text, context_text).
+        prompt_text includes the last chunk of committed tokens, to provide
+        context for the transcription.
         """
-        k = len(self.committed)
-        while k > 0 and self.committed[k - 1].end > self.buffer_time_offset:
-            k -= 1
-
-        prompt_tokens = self.committed[:k]
-        prompt_words = [token.text for token in prompt_tokens]
         prompt_list = []
-        length_count = 0
-        # Use the last words until reaching 200 characters.
-        while prompt_words and length_count < 200:
-            word = prompt_words.pop(-1)
-            length_count += len(word) + 1
-            prompt_list.append(word)
-        non_prompt_tokens = self.committed[k:]
-        context_text = self.asr.sep.join(token.text for token in non_prompt_tokens)
+        context_text = ""
+        # Prompt with max 16 tokens
+        for token in list(reversed(self.committed))[-16:]:
+            prompt_list.append(token.text)
+            context_text = token.text + self.asr.sep + context_text
         return self.asr.sep.join(prompt_list[::-1]), context_text
 
     def get_buffer(self):
@@ -177,19 +193,44 @@ class OnlineASRProcessor:
         Get the unvalidated buffer in string format.
         """
         return self.concatenate_tokens(self.transcript_buffer.buffer)
-        
 
     def process_iter(self) -> Transcript:
         """
-        Processes the current audio buffer.
-
+        Processes the current audio buffer with periodic forced trimming to prevent lag.
+        
         Returns a Transcript object representing the committed transcript.
         """
+        # Check if we need to force trim based on time interval
+        current_time = time.time()
+        if current_time - self.last_trim_time > self.force_trim_interval:
+            # Force trim even if not at natural boundary
+            logger.debug(f"Forcing buffer trim after {self.force_trim_interval}s interval")
+            buffer_duration = len(self.audio_buffer) / self.SAMPLING_RATE
+            if buffer_duration > 3.0:  # Only trim if we have at least 3 seconds
+                trim_point = max(1.0, buffer_duration * 0.5)  # Trim half of buffer
+                trim_time = self.buffer_time_offset + trim_point
+                self.chunk_at(trim_time)
+                self.last_trim_time = current_time
+        
         prompt_text, _ = self.prompt()
         logger.debug(
             f"Transcribing {len(self.audio_buffer)/self.SAMPLING_RATE:.2f} seconds from {self.buffer_time_offset:.2f}"
         )
-        res = self.asr.transcribe(self.audio_buffer, init_prompt=prompt_text)
+        
+        # Use time-based beam size adjustment for large buffers to reduce processing time
+        init_kwargs = {}
+        if hasattr(self.asr, 'transcribe_with_params'):
+            buffer_duration = len(self.audio_buffer) / self.SAMPLING_RATE
+            if buffer_duration > 10.0:
+                # Use faster parameters for large buffers
+                init_kwargs['beam_size'] = 1
+        
+        # Perform transcription with potential parameters
+        if hasattr(self.asr, 'transcribe_with_params') and init_kwargs:
+            res = self.asr.transcribe_with_params(self.audio_buffer, init_prompt=prompt_text, **init_kwargs)
+        else:
+            res = self.asr.transcribe(self.audio_buffer, init_prompt=prompt_text)
+            
         tokens = self.asr.ts_words(res)  # Expecting List[ASRToken]
         self.transcript_buffer.insert(tokens, self.buffer_time_offset)
         committed_tokens = self.transcript_buffer.flush()
@@ -199,14 +240,14 @@ class OnlineASRProcessor:
         incomp = self.concatenate_tokens(self.transcript_buffer.buffer)
         logger.debug(f"INCOMPLETE: {incomp.text}")
 
-        if committed_tokens and self.buffer_trimming_way == "sentence":
-            if len(self.audio_buffer) / self.SAMPLING_RATE > self.buffer_trimming_sec:
+        # More aggressive buffer management to prevent lag
+        buffer_duration = len(self.audio_buffer) / self.SAMPLING_RATE
+        if buffer_duration > self.buffer_trimming_sec * 0.7:  # Lower threshold for trimming
+            if self.buffer_trimming_way == "sentence" and committed_tokens:
                 self.chunk_completed_sentence()
-
-        s = self.buffer_trimming_sec if self.buffer_trimming_way == "segment" else 30
-        if len(self.audio_buffer) / self.SAMPLING_RATE > s:
-            self.chunk_completed_segment(res)
-            logger.debug("Chunking segment")
+            elif self.buffer_trimming_way == "segment":
+                self.chunk_completed_segment(res)
+                
         logger.debug(
             f"Length of audio buffer now: {len(self.audio_buffer)/self.SAMPLING_RATE:.2f} seconds"
         )
@@ -214,14 +255,14 @@ class OnlineASRProcessor:
 
     def chunk_completed_sentence(self):
         """
-        If the committed tokens form at least two sentences, chunk the audio
-        buffer at the end time of the penultimate sentence.
-        Also ensures chunking happens if audio buffer exceeds a time limit.
+        Aggressively trim the audio buffer to prevent lag buildup.
+        If the committed tokens form at least one sentence, chunk at the 
+        end of the last sentence, or aggressively trim if buffer is growing too large.
         """
         buffer_duration = len(self.audio_buffer) / self.SAMPLING_RATE        
         if not self.committed:
-            if buffer_duration > self.buffer_trimming_sec:
-                chunk_time = self.buffer_time_offset + (buffer_duration / 2)
+            if buffer_duration > self.buffer_trimming_sec * 0.7:  # More aggressive
+                chunk_time = self.buffer_time_offset + (buffer_duration / 3)
                 logger.debug(f"--- No speech detected, forced chunking at {chunk_time:.2f}")
                 self.chunk_at(chunk_time)
             return
@@ -232,18 +273,20 @@ class OnlineASRProcessor:
             logger.debug(f"\tSentence: {sentence.text}")
         
         chunk_done = False
-        if len(sentences) >= 2:
-            while len(sentences) > 2:
-                sentences.pop(0)
-            chunk_time = sentences[-2].end
+        if len(sentences) >= 1:  # Reduced from 2 to 1 - chunk at any sentence
+            if len(sentences) > 1:
+                sentences.pop(0)  # Remove first sentence if we have multiple
+            chunk_time = sentences[-1].end
             logger.debug(f"--- Sentence chunked at {chunk_time:.2f}")
             self.chunk_at(chunk_time)
             chunk_done = True
+            self.last_trim_time = time.time()
         
-        if not chunk_done and buffer_duration > self.buffer_trimming_sec:
+        if not chunk_done and buffer_duration > self.buffer_trimming_sec * 0.8:  # More aggressive
             last_committed_time = self.committed[-1].end
             logger.debug(f"--- Not enough sentences, chunking at last committed time {last_committed_time:.2f}")
             self.chunk_at(last_committed_time)
+            self.last_trim_time = time.time()
 
     def chunk_completed_segment(self, res):
         """
@@ -252,11 +295,12 @@ class OnlineASRProcessor:
         """
         buffer_duration = len(self.audio_buffer) / self.SAMPLING_RATE        
         if not self.committed:
-            if buffer_duration > self.buffer_trimming_sec:
+            if buffer_duration > self.buffer_trimming_sec * 0.7:  # More aggressive
                 # More aggressive chunking when no speech detected
                 chunk_time = self.buffer_time_offset + (buffer_duration / 3)  # Chunk earlier at 1/3 of buffer
                 logger.debug(f"--- No speech detected, aggressive chunking at {chunk_time:.2f}")
                 self.chunk_at(chunk_time)
+                self.last_trim_time = time.time()
             return
         
         logger.debug("Processing committed tokens for segmenting")
@@ -265,48 +309,55 @@ class OnlineASRProcessor:
         chunk_done = False
         
         # More aggressive chunking strategy
-        if len(ends) > 1:
-            logger.debug("Multiple segments available for chunking")
+        if len(ends) > 0:  # Changed from 1 to 0 - trim even with one segment
+            logger.debug("Segments available for chunking")
             
             # First try to find optimal chunking point
             optimal_point_found = False
-            for i in range(1, len(ends)):
+            for i in range(1, len(ends) + 1):
+                if i > len(ends):
+                    break
                 segment_end = ends[-i] + self.buffer_time_offset
                 
-                # Check if this is a good chunking point
-                if segment_end <= last_committed_time:
+                # More permissive chunking criteria
+                if segment_end <= last_committed_time or buffer_duration > self.buffer_trimming_sec * 0.8:
                     logger.debug(f"--- Segment chunked at optimal point {segment_end:.2f}")
                     self.chunk_at(segment_end)
                     chunk_done = True
                     optimal_point_found = True
+                    self.last_trim_time = time.time()
                     break
             
             # If no optimal point found but we have segments and the buffer is getting large
-            if not optimal_point_found and buffer_duration > self.buffer_trimming_sec * 0.7:
+            if not optimal_point_found and buffer_duration > self.buffer_trimming_sec * 0.6:  # More aggressive
                 # Use the latest segment even if not optimal
-                segment_end = ends[-1] + self.buffer_time_offset
-                if segment_end > 0:
-                    logger.debug(f"--- Buffer growing, forced chunking at latest segment {segment_end:.2f}")
-                    self.chunk_at(segment_end)
-                    chunk_done = True
+                if len(ends) > 0:
+                    segment_end = ends[-1] + self.buffer_time_offset
+                    if segment_end > 0:
+                        logger.debug(f"--- Buffer growing, forced chunking at latest segment {segment_end:.2f}")
+                        self.chunk_at(segment_end)
+                        chunk_done = True
+                        self.last_trim_time = time.time()
         else:
             logger.debug("--- Not enough segments to chunk")
         
         # Enhanced aggressive chunking for long buffers
         if not chunk_done:
-            if buffer_duration > self.buffer_trimming_sec * 0.8:
+            if buffer_duration > self.buffer_trimming_sec * 0.7:  # More aggressive
                 # For buffers approaching the limit, chunk at last committed token
                 logger.debug(f"--- Buffer approaching limit, chunking at last committed time {last_committed_time:.2f}")
                 self.chunk_at(last_committed_time)
-            elif buffer_duration > self.buffer_trimming_sec * 1.2:
+                self.last_trim_time = time.time()
+            elif buffer_duration > self.buffer_trimming_sec * 0.9:  # More aggressive
                 # For buffers exceeding the limit, take more drastic action
                 # Chunk at midpoint between buffer start and last committed
                 midpoint = self.buffer_time_offset + (last_committed_time - self.buffer_time_offset) * 0.7
                 logger.debug(f"--- Buffer exceeded limit, emergency chunking at {midpoint:.2f}")
                 self.chunk_at(midpoint)
+                self.last_trim_time = time.time()
         
         logger.debug("Segment chunking complete")
-        
+
     def chunk_at(self, time: float):
         """
         Trim both the hypothesis and audio buffer at the given time.
@@ -317,11 +368,26 @@ class OnlineASRProcessor:
         )
         self.transcript_buffer.pop_committed(time)
         cut_seconds = time - self.buffer_time_offset
-        self.audio_buffer = self.audio_buffer[int(cut_seconds * self.SAMPLING_RATE):]
-        self.buffer_time_offset = time
+        
+        # Safety check to prevent bad trimming
+        if cut_seconds <= 0 or cut_seconds >= len(self.audio_buffer)/self.SAMPLING_RATE:
+            logger.warning(f"Invalid chunk point {time:.2f}s, offset: {self.buffer_time_offset:.2f}s")
+            # If invalid, just trim a safe amount
+            safe_trim = min(len(self.audio_buffer) // 2, int(self.SAMPLING_RATE * 5))
+            if safe_trim > 0:
+                self.audio_buffer = self.audio_buffer[safe_trim:]
+                self.buffer_time_offset += safe_trim / self.SAMPLING_RATE
+        else:
+            trim_samples = int(cut_seconds * self.SAMPLING_RATE)
+            self.audio_buffer = self.audio_buffer[trim_samples:]
+            self.buffer_time_offset = time
+            
         logger.debug(
             f"Audio buffer length after chunking: {len(self.audio_buffer)/self.SAMPLING_RATE:.2f}s"
         )
+        
+        # Update last trim time
+        self.last_trim_time = time.time()
 
     def words_to_sentences(self, tokens: List[ASRToken]) -> List[Sentence]:
         """

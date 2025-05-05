@@ -5,6 +5,7 @@ from time import time, sleep
 import math
 import logging
 import traceback
+import uuid
 from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor
 from whisperlivekit.timed_objects import ASRToken
@@ -34,6 +35,9 @@ class AudioProcessor:
         
         models = WhisperLiveKit()
         
+        # Generate a unique client ID for this processor instance
+        self.client_id = str(uuid.uuid4())
+        
         # Audio processing settings
         self.args = models.args
         self.sample_rate = 16000
@@ -62,6 +66,7 @@ class AudioProcessor:
         self.asr = models.asr
         self.tokenizer = models.tokenizer
         self.diarization = models.diarization
+        self.batch_service = models.batch_service  # Use the shared batch service
         self.ffmpeg_process = self.start_ffmpeg_decoder()
         self.transcription_queue = asyncio.Queue(maxsize=10) if self.args.transcription else None
         self.diarization_queue = asyncio.Queue(maxsize=10) if self.args.diarization else None
@@ -75,6 +80,8 @@ class AudioProcessor:
         self.use_parallel = True  # Enable parallel processing
         self.max_update_freq = 0.2  # Maximum update frequency in seconds
         self.last_update = 0
+
+        logger.info(f"AudioProcessor initialized with client_id: {self.client_id}")
 
     def convert_pcm_to_float(self, pcm_buffer):
         """Convert PCM buffer in s16le format to normalized NumPy array."""
@@ -258,7 +265,7 @@ class AudioProcessor:
                     
                     if self.args.diarization and self.diarization_queue:
                         try:
-                            self.diarization_queue.put_nowait(self.convert_pcm_to_float(self.pcm_buffer).copy())
+                            self.diarization_queue.put_nowait(pcm_array.copy())
                         except asyncio.QueueFull:
                             logger.warning("Diarization queue full, skipping chunk")
                     
@@ -284,44 +291,96 @@ class AudioProcessor:
             try:
                 pcm_array = await self.transcription_queue.get()
                 
-                # Perform CPU-intensive transcription in thread pool
-                def process_transcription():
+                # If using batch service, submit to it
+                if self.batch_service and hasattr(self.batch_service, 'submit'):
                     try:
-                        # Process audio and extract tokens - this is CPU intensive
-                        self.online.insert_audio_chunk(pcm_array)
-                        return self.online.process_iter()
+                        # Submit to batch service and get results
+                        batch_result = await self.batch_service.submit(self.client_id, pcm_array)
+                        
+                        # Process the results if valid
+                        if batch_result and not batch_result.get("error"):
+                            segments = batch_result.get("segments", [])
+                            tokens = batch_result.get("tokens", [])
+                            
+                            # Process the tokens and update state
+                            if tokens:
+                                # Insert audio chunk into online ASR (needed for buffer management)
+                                self.online.insert_audio_chunk(pcm_array)
+                                
+                                # Update with tokens from batch processing instead
+                                # of using self.online.process_iter()
+                                new_tokens = tokens
+                                
+                                if new_tokens:
+                                    self.full_transcription += self.sep.join([t.text for t in new_tokens])
+                                
+                                # Get buffer information
+                                _buffer = self.online.get_buffer()
+                                buffer = _buffer.text
+                                end_buffer = _buffer.end if _buffer.end else (
+                                    new_tokens[-1].end if new_tokens else 0
+                                )
+                                
+                                # Avoid duplicating content
+                                if buffer in self.full_transcription:
+                                    buffer = ""
+                                    
+                                await self.update_transcription(
+                                    new_tokens, buffer, end_buffer, self.full_transcription, self.sep
+                                )
+                        else:
+                            # Fall back to regular processing if batch processing failed
+                            logger.warning(f"Batch processing error: {batch_result.get('error', 'Unknown error')}")
+                            await self._process_transcription_locally(pcm_array)
                     except Exception as e:
-                        logger.error(f"Error in transcription thread: {e}")
-                        return []
-                
-                # Run in thread pool to avoid blocking the event loop
-                new_tokens = await asyncio.get_event_loop().run_in_executor(
-                    thread_pool, process_transcription
-                )
-                
-                if new_tokens:
-                    self.full_transcription += self.sep.join([t.text for t in new_tokens])
-                    
-                # Get buffer information
-                _buffer = self.online.get_buffer()
-                buffer = _buffer.text
-                end_buffer = _buffer.end if _buffer.end else (
-                    new_tokens[-1].end if new_tokens else 0
-                )
-                
-                # Avoid duplicating content
-                if buffer in self.full_transcription:
-                    buffer = ""
-                    
-                await self.update_transcription(
-                    new_tokens, buffer, end_buffer, self.full_transcription, self.sep
-                )
+                        logger.error(f"Error in batch transcription: {e}")
+                        logger.error(traceback.format_exc())
+                        # Fall back to local processing
+                        await self._process_transcription_locally(pcm_array)
+                else:
+                    # Use regular processing if batch service is not available
+                    await self._process_transcription_locally(pcm_array)
                 
             except Exception as e:
                 logger.warning(f"Exception in transcription_processor: {e}")
                 logger.warning(f"Traceback: {traceback.format_exc()}")
             finally:
                 self.transcription_queue.task_done()
+                
+    async def _process_transcription_locally(self, pcm_array):
+        """Process transcription locally without batch service"""
+        # Perform CPU-intensive transcription in thread pool
+        def process_transcription():
+            try:
+                # Process audio and extract tokens - this is CPU intensive
+                self.online.insert_audio_chunk(pcm_array)
+                return self.online.process_iter()
+            except Exception as e:
+                logger.error(f"Error in transcription thread: {e}")
+                return []
+        
+        # Run in thread pool to avoid blocking the event loop
+        new_tokens = await asyncio.get_event_loop().run_in_executor(
+            thread_pool, process_transcription
+        )
+        
+        if new_tokens:
+            self.full_transcription += self.sep.join([t.text for t in new_tokens])
+            
+        # Get buffer information
+        _buffer = self.online.get_buffer()
+        buffer = _buffer.text
+        end_buffer = _buffer.end if _buffer.end else (
+            new_tokens[-1].end if new_tokens else 0
+        )
+        
+        # Avoid duplicating content
+        if buffer in self.full_transcription:
+            buffer = ""
+            
+        await self.update_transcription(
+            new_tokens, buffer, end_buffer, self.full_transcription, self.sep
+        )
 
     async def diarization_processor(self, diarization_obj):
         """Process audio chunks for speaker diarization with thread pool optimization."""
@@ -355,6 +414,8 @@ class AudioProcessor:
         """Format processing results for output with optimized update frequency."""
         last_yield_time = 0
         min_yield_interval = 0.1  # Minimum time between yields to client
+        max_tokens_processed = 500  # Maximum number of tokens to process in one cycle
+        last_state_hash = ""  # Track state changes to avoid redundant formatting
         
         while True:
             try:
@@ -367,6 +428,17 @@ class AudioProcessor:
                 
                 # Get current state
                 state = await self.get_current_state()
+                
+                # Create a simple hash to check if state has meaningfully changed
+                simple_hash = f"{len(state['tokens'])}-{state['end_buffer']}-{state['end_attributed_speaker']}-{len(state['buffer_transcription'])}-{len(state['buffer_diarization'])}"
+                
+                # Skip processing if state hasn't changed significantly
+                if simple_hash == last_state_hash:
+                    await asyncio.sleep(0.05)
+                    continue
+                
+                last_state_hash = simple_hash
+                
                 tokens = state["tokens"]
                 buffer_transcription = state["buffer_transcription"]
                 buffer_diarization = state["buffer_diarization"]
@@ -379,14 +451,27 @@ class AudioProcessor:
                     state = await self.get_current_state()
                     tokens = state["tokens"]
                 
+                # Limit tokens processing to prevent lag in very long sessions
+                if len(tokens) > max_tokens_processed:
+                    # Only process the most recent tokens
+                    recent_tokens = tokens[-max_tokens_processed:]
+                    logger.info(f"Limiting token processing: {len(tokens)} tokens reduced to {len(recent_tokens)}")
+                    # Keep the first token to maintain speaker information
+                    if tokens and len(tokens) > max_tokens_processed:
+                        processed_tokens = [tokens[0]] + recent_tokens
+                    else:
+                        processed_tokens = recent_tokens
+                else:
+                    processed_tokens = tokens
+                
                 # Format output with optimized processing
                 previous_speaker = -1
                 lines = []
                 last_end_diarized = 0
                 undiarized_text = []
                 
-                # Process each token (this is potentially slow with many tokens)
-                for token in tokens:
+                # Process each token with vectorized operations where possible
+                for token in processed_tokens:
                     speaker = token.speaker
                     
                     # Handle diarization
@@ -395,11 +480,11 @@ class AudioProcessor:
                             undiarized_text.append(token.text)
                             continue
                         elif (speaker in [-1, 0]) and token.end < end_attributed_speaker:
-                            speaker = previous_speaker
+                            speaker = previous_speaker if previous_speaker != -1 else 1
                         if speaker not in [-1, 0]:
                             last_end_diarized = max(token.end, last_end_diarized)
 
-                    # Group by speaker with optimized comparisons
+                    # Use more efficient string formatting
                     if speaker != previous_speaker or not lines:
                         lines.append({
                             "speaker": speaker,
@@ -410,19 +495,24 @@ class AudioProcessor:
                         })
                         previous_speaker = speaker
                     elif token.text:  # Only append if text isn't empty
-                        lines[-1]["text"] += sep + token.text
+                        # More efficient string concatenation
+                        if not lines[-1]["text"]:
+                            lines[-1]["text"] = token.text
+                        else:
+                            lines[-1]["text"] += sep + token.text
                         lines[-1]["end"] = format_time(token.end)
                         lines[-1]["diff"] = round(token.end - last_end_diarized, 2)
                 
-                # Handle undiarized text
+                # Handle undiarized text with optimized string operations
                 if undiarized_text:
+                    # Use join instead of repeated concatenation
                     combined = sep.join(undiarized_text)
                     if buffer_transcription:
                         combined += sep
                     await self.update_diarization(end_attributed_speaker, combined)
                     buffer_diarization = combined
                 
-                # Create response object
+                # Create response object with reduced allocations
                 if not lines:
                     lines = [{
                         "speaker": 1,
@@ -441,23 +531,29 @@ class AudioProcessor:
                 }
                 
                 # Compute response content hash for change detection
-                response_content = ' '.join([f"{line['speaker']} {line['text']}" for line in lines]) + \
-                                  f" | {buffer_transcription} | {buffer_diarization}"
+                # Use a more efficient hash calculation
+                lines_hash = ''.join([f"{line['speaker']}-{line['text'][:10]}" for line in lines[:3]])
+                buffers_hash = f"{buffer_transcription[:20]}-{buffer_diarization[:20]}"
+                response_hash = f"{lines_hash}|{buffers_hash}"
                 
-                # Only yield if content has changed
-                if response_content != self.last_response_content and (lines or buffer_transcription or buffer_diarization):
+                # Only yield if content has meaningfully changed
+                if response_hash != getattr(self, '_last_response_hash', '') and (lines or buffer_transcription or buffer_diarization):
                     yield response
-                    self.last_response_content = response_content
+                    self._last_response_hash = response_hash
                     last_yield_time = current_time
                 
-                # Dynamic sleep time based on system activity
-                sleep_time = 0.05 if current_time - last_yield_time < 1.0 else 0.1
+                # Dynamic sleep time based on system activity and lag
+                # Use shorter sleep for active transcription, longer when idle
+                is_active = current_time - last_yield_time < 2.0
+                sleep_time = 0.05 if is_active else 0.2
                 await asyncio.sleep(sleep_time)
                 
             except Exception as e:
                 logger.warning(f"Exception in results_formatter: {e}")
                 logger.warning(f"Traceback: {traceback.format_exc()}")
-                await asyncio.sleep(0.5)  # Back off on error
+                # Add exponential backoff on error
+                await asyncio.sleep(min(0.5 * (1 + getattr(self, '_error_count', 0)), 2.0))
+                self._error_count = getattr(self, '_error_count', 0) + 1
         
     async def create_tasks(self):
         """Create and start processing tasks with improved task management."""
