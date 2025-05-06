@@ -511,3 +511,215 @@ class OpenaiApiASR(ASRBase):
 
     def set_translate_task(self):
         self.task = "translate"
+
+
+class ParakeetTDTASR(ASRBase):
+    """Uses NVIDIA's Parakeet TDT model as the backend using Hugging Face Transformers."""
+    sep = ""
+
+    def load_model(self, modelsize=None, cache_dir=None, model_dir=None):
+        try:
+            from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+            import os
+            
+            # Set model name for Parakeet TDT
+            model_name = "nvidia/parakeet-tdt-0.6b-v2"
+            if modelsize and modelsize.startswith("nvidia/parakeet"):
+                model_name = modelsize
+            
+            logger.info(f"Loading Parakeet TDT model: {model_name}")
+            
+            # Clear CUDA cache before loading model if using GPU
+            if torch and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+                # Check available GPU memory
+                try:
+                    free_memory = torch.cuda.mem_get_info()[0] / (1024**3)  # Convert to GB
+                    total_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                    logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
+                    logger.info(f"Available GPU memory: {free_memory:.2f}GB of {total_memory:.2f}GB total")
+                except Exception as e:
+                    logger.warning(f"Could not check GPU memory: {e}")
+            
+            # Set device
+            device = "cuda" if torch and torch.cuda.is_available() else "cpu"
+            logger.info(f"Using device: {device}")
+            
+            # Load the model from HuggingFace Hub
+            processor = AutoProcessor.from_pretrained(model_name)
+            model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                model_name,
+                torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+                low_cpu_mem_usage=True,
+                use_safetensors=True,
+            )
+            
+            if device == "cuda":
+                model = model.to(device)
+            
+            # Record model information for reference
+            self.model = model
+            self.processor = processor
+            self.model_size = model_name
+            self.device = device
+            
+            logger.info(f"Successfully loaded Parakeet TDT model on {device}")
+            return model
+            
+        except Exception as e:
+            logger.error(f"Failed to load Parakeet TDT model: {e}")
+            raise RuntimeError(f"Failed to load Parakeet TDT model: {e}")
+
+    def transcribe(self, audio: np.ndarray, init_prompt: str = "") -> list:
+        """
+        Transcribe audio using the Parakeet TDT model via Transformers.
+        """
+        try:
+            import torch
+            
+            # Prepare the input features
+            input_features = self.processor(
+                audio, 
+                sampling_rate=16000, 
+                return_tensors="pt"
+            ).input_features
+            
+            if self.device == "cuda":
+                input_features = input_features.to(self.device)
+            
+            # Generate transcription with timestamps
+            with torch.no_grad():
+                forced_decoder_ids = self.processor.get_decoder_prompt_ids(
+                    language=self.original_language if self.original_language else "en", 
+                    task="transcribe",
+                    return_timestamps=True
+                )
+                
+                outputs = self.model.generate(
+                    input_features,
+                    forced_decoder_ids=forced_decoder_ids,
+                    max_new_tokens=256,
+                    return_timestamps=True
+                )
+            
+            # Process the output tokens into text with timestamps
+            result = self.processor.batch_decode(outputs, skip_special_tokens=False)
+            segments = self._process_parakeet_result(result[0], audio)
+            
+            return segments
+            
+        except Exception as e:
+            logger.error(f"Error during Parakeet TDT transcription: {e}")
+            # Return empty result on error
+            return []
+
+    def _process_parakeet_result(self, result_text, audio):
+        """Process the raw Parakeet TDT output into segments with timestamps."""
+        from dataclasses import dataclass
+        import re
+        
+        @dataclass
+        class Segment:
+            start: float
+            end: float
+            text: str
+            words: list
+            no_speech_prob: float = 0.0
+            
+        @dataclass
+        class Word:
+            start: float
+            end: float
+            word: str
+            probability: float = 0.9
+        
+        segments = []
+        
+        # Parse the timestamps and text using regex
+        # Parakeet TDT outputs format: "<0.0> text <1.2> more text <2.3>"
+        timestamp_pattern = r'<(\d+\.\d+)>'
+        
+        # Extract timestamps and text segments
+        timestamps = [float(t) for t in re.findall(timestamp_pattern, result_text)]
+        text_segments = re.split(timestamp_pattern, result_text)
+        text_segments = [s.strip() for s in text_segments if s.strip() and not s.strip().replace('.', '').isdigit()]
+        
+        if len(timestamps) >= 2 and text_segments:
+            for i in range(len(text_segments)):
+                if i+1 < len(timestamps):
+                    start_time = timestamps[i]
+                    end_time = timestamps[i+1]
+                    text = text_segments[i]
+                    
+                    # Create word-level timestamps by dividing the segment
+                    words = []
+                    if text:
+                        word_list = text.split()
+                        if word_list:
+                            duration = end_time - start_time
+                            word_duration = duration / len(word_list)
+                            
+                            for j, word in enumerate(word_list):
+                                word_start = start_time + j * word_duration
+                                word_end = word_start + word_duration
+                                words.append(Word(start=word_start, end=word_end, word=word))
+                    
+                    segment = Segment(
+                        start=start_time,
+                        end=end_time,
+                        text=text,
+                        words=words
+                    )
+                    segments.append(segment)
+        
+        # If no segments were created but we have text, create a default segment
+        if not segments and text_segments:
+            full_text = " ".join(text_segments)
+            audio_duration = len(audio) / 16000
+            
+            segment = Segment(
+                start=0.0,
+                end=audio_duration,
+                text=full_text,
+                words=[]
+            )
+            segments.append(segment)
+        
+        return segments
+
+    def transcribe_batch(self, audio_batch: list) -> list:
+        """Process a batch of audio samples."""
+        results = []
+        
+        # Process each audio sample individually
+        for audio in audio_batch:
+            segments = self.transcribe(audio)
+            results.append({
+                "segments": segments,
+                "tokens": self.ts_words(segments)
+            })
+        
+        return results
+
+    def ts_words(self, segments) -> List[ASRToken]:
+        """Extract word-level timestamps from processed output."""
+        tokens = []
+        for segment in segments:
+            for word in segment.words:
+                token = ASRToken(word.start, word.end, word.word, probability=getattr(word, 'probability', 0.9))
+                tokens.append(token)
+        return tokens
+
+    def segments_end_ts(self, segments) -> List[float]:
+        """Return the end timestamps of all segments."""
+        return [segment.end for segment in segments]
+
+    def use_vad(self):
+        """VAD is built into the model's preprocessing."""
+        self.transcribe_kargs["vad_filter"] = True
+
+    def set_translate_task(self):
+        """Set to translation mode if supported."""
+        logger.warning("Translation not fully supported by Parakeet TDT model, but will attempt to use translation mode")
+        self.transcribe_kargs["task"] = "translate"
