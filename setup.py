@@ -25,6 +25,7 @@ setup(
         "whisper-timestamped": ["whisper-timestamped"],
         "mlx-whisper": ["mlx-whisper"],
         "openai": ["openai"],
+        "parakeet": ["nemo_toolkit[asr]"],
     },
     package_data={
         'whisperlivekit': ['web/*.html'],

@@ -326,7 +326,7 @@ def parse_args():
         "--backend",
         type=str,
         default="faster-whisper",
-        choices=["faster-whisper", "whisper_timestamped", "mlx-whisper", "openai-api"],
+        choices=["faster-whisper", "whisper_timestamped", "mlx-whisper", "openai-api", "parakeet-tdt"],
         help="Load only this backend for Whisper processing.",
     )
     parser.add_argument(

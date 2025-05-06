@@ -5,7 +5,7 @@ import librosa
 from functools import lru_cache
 import time
 import logging
-from .backends import FasterWhisperASR, MLXWhisper, WhisperTimestampedASR, OpenaiApiASR
+from .backends import FasterWhisperASR, MLXWhisper, WhisperTimestampedASR, OpenaiApiASR, ParakeetTDTASR
 from .online_asr import OnlineASRProcessor, VACOnlineASRProcessor
 
 logger = logging.getLogger(__name__)
@@ -69,6 +69,13 @@ def backend_factory(args):
     if backend == "openai-api":
         logger.debug("Using OpenAI API.")
         asr = OpenaiApiASR(lan=args.lan)
+    elif backend == "parakeet-tdt":
+        logger.debug("Using NVIDIA Parakeet TDT model.")
+        t = time.time()
+        logger.info(f"Loading NVIDIA Parakeet TDT model for language {args.lan}...")
+        asr = ParakeetTDTASR(lan=args.lan)
+        e = time.time()
+        logger.info(f"done. It took {round(e-t,2)} seconds.")
     else:
         if backend == "faster-whisper":
             asr_cls = FasterWhisperASR
