@@ -36,19 +36,8 @@ class BatchTranscriptionRequest:
 class BatchTranscriptionService:
     """Manages batched transcription requests for multiple clients using a single model"""
     
-    _instance = None
-    
-    def __new__(cls, *args, **kwargs):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._initialized = False
-        return cls._instance
-    
     def __init__(self, asr=None, tokenizer=None, batch_size=8, max_wait_time=0.1):
         """Initialize the batch processing service with shared model"""
-        if hasattr(self, '_initialized') and self._initialized:
-            return
-            
         self.asr = asr
         self.tokenizer = tokenizer
         self.batch_size = batch_size  # Maximum batch size
@@ -68,7 +57,6 @@ class BatchTranscriptionService:
         # Batch processing task
         self.is_running = True
         self.processing_task = None
-        self._initialized = True
         
         # Start the background task if asr is available
         if self.asr:
@@ -252,6 +240,12 @@ def parse_args():
         "--port", type=int, default=8000, help="The port number to bind the server to."
     )
     parser.add_argument(
+        "--num-models",
+        type=int,
+        default=1,
+        help="Number of ASR model instances to load.",
+    )
+    parser.add_argument(
         "--warmup-file",
         type=str,
         default=None,
@@ -382,14 +376,16 @@ def parse_args():
 class WhisperLiveKit:
     _instance = None
     _initialized = False
-    
+    _service_index_lock = threading.Lock() # Lock for round-robin index
+    _current_service_index = 0 # For round-robin assignment of batch services
+
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cls._instance
     
     def __init__(self, **kwargs):
-        if WhisperLiveKit._initialized:
+        if WhisperLiveKit._initialized and self._instance is not None:
             return
             
         default_args = vars(parse_args())
@@ -398,45 +394,86 @@ class WhisperLiveKit:
         
         self.args = Namespace(**merged_args)
         
-        self.asr = None
-        self.tokenizer = None
-        self.diarization = None
-        self.batch_service = None
+        self.asr_instances = []
+        self.tokenizer_instances = []
+        self.batch_services = []
         
+        self.diarization = None
+
         if self.args.transcription:
-            self.asr, self.tokenizer = backend_factory(self.args)
-            warmup_asr(self.asr, self.args.warmup_file)
+            for i in range(self.args.num_models):
+                logger.info(f"Initializing ASR model instance {i+1} of {self.args.num_models}...")
+                asr_instance, tokenizer_instance = backend_factory(self.args)
+                warmup_asr(asr_instance, self.args.warmup_file)
+                self.asr_instances.append(asr_instance)
+                self.tokenizer_instances.append(tokenizer_instance)
+
+                optimal_batch_size = 16
+                if "large" in self.args.model or "distil" in self.args.model:
+                    if hasattr(asr_instance, "device") and asr_instance.device == "cuda":
+                        try:
+                            import torch
+                            if torch.cuda.is_available():
+                                gpu_mem = torch.cuda.get_device_properties(i % torch.cuda.device_count()).total_memory / (1024**3)
+                                if gpu_mem > 40: optimal_batch_size = 24
+                                if gpu_mem > 80: optimal_batch_size = 32
+                                logger.info(f"Instance {i+1} on GPU {i % torch.cuda.device_count()} with {gpu_mem:.1f}GB RAM, batch size {optimal_batch_size}")
+                        except Exception as e:
+                            logger.warning(f"Could not detect GPU memory for instance {i+1}: {e}, using default batch size {optimal_batch_size}")
+                
+                batch_service_instance = BatchTranscriptionService(
+                    asr=asr_instance,
+                    tokenizer=tokenizer_instance,
+                    batch_size=optimal_batch_size,
+                    max_wait_time=0.1
+                )
+                batch_service_instance.start()
+                self.batch_services.append(batch_service_instance)
             
-            # Initialize batch transcription service with optimal batch size for A100
-            # For large models like distil-whisper-v3 on A100, we can use larger batch sizes
-            optimal_batch_size = 16
-            if "large" in self.args.model or "distil" in self.args.model:
-                if hasattr(self.asr, "device") and self.asr.device == "cuda":
-                    # For A100 with 80GB, we can use larger batches
-                    try:
-                        import torch
-                        if torch.cuda.is_available():
-                            gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-                            if gpu_mem > 40:  # For A100 40GB+
-                                optimal_batch_size = 24
-                            if gpu_mem > 80:  # For A100 80GB+
-                                optimal_batch_size = 32
-                            logger.info(f"Detected {gpu_mem:.1f}GB GPU memory, setting batch size to {optimal_batch_size}")
-                    except Exception as e:
-                        logger.warning(f"Could not detect GPU memory: {e}, using default batch size {optimal_batch_size}")
-            
-            self.batch_service = BatchTranscriptionService(
-                asr=self.asr,
-                tokenizer=self.tokenizer,
-                batch_size=optimal_batch_size,
-                max_wait_time=0.1  # 100ms max wait time for batch collection
-            )
+            if not self.batch_services:
+                logger.warning("No batch services were initialized. Transcription might not work.")
+            else:
+                logger.info(f"Initialized {len(self.batch_services)} ASR and batch service instances.")
+
 
         if self.args.diarization:
             from whisperlivekit.diarization.diarization_online import DiartDiarization
             self.diarization = DiartDiarization()
             
         WhisperLiveKit._initialized = True
+
+    def get_next_batch_service(self) -> Optional[BatchTranscriptionService]:
+        """Returns the next BatchTranscriptionService in a round-robin fashion."""
+        if not self.batch_services:
+            logger.error("No batch services available to assign.")
+            return None
+        
+        with WhisperLiveKit._service_index_lock:
+            service = self.batch_services[WhisperLiveKit._current_service_index]
+            WhisperLiveKit._current_service_index = (WhisperLiveKit._current_service_index + 1) % len(self.batch_services)
+            logger.info(f"Assigning batch service instance {WhisperLiveKit._current_service_index} (0-indexed) to new client.")
+        return service
+
+    def get_asr_and_tokenizer(self, batch_service_instance: BatchTranscriptionService) -> Tuple[Optional[Any], Optional[Any]]:
+        """
+        Given a BatchTranscriptionService instance, find the corresponding ASR and Tokenizer.
+        This assumes that the order in self.asr_instances, self.tokenizer_instances, 
+        and self.batch_services is maintained.
+        """
+        if not batch_service_instance:
+            return None, None
+        try:
+            idx = self.batch_services.index(batch_service_instance)
+            asr = self.asr_instances[idx] if idx < len(self.asr_instances) else None
+            tokenizer = self.tokenizer_instances[idx] if idx < len(self.tokenizer_instances) else None
+            return asr, tokenizer
+        except ValueError:
+            logger.error("Provided batch_service_instance not found in the list.")
+            return None, None
+        except IndexError:
+            logger.error("Mismatch in lengths of asr/tokenizer/batch_service lists.")
+            return None, None
+
 
     def web_interface(self):
         import pkg_resources

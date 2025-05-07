@@ -30,16 +30,21 @@ class AudioProcessor:
     Handles audio processing, state management, and result formatting.
     """
     
+    # Added a class variable to keep track of clients per service instance
+    _clients_per_service = {}
+    _clients_per_service_lock = asyncio.Lock() # Lock for updating client counts
+    MAX_CLIENTS_PER_INSTANCE = 2 # Max clients per ASR/BatchService instance
+
     def __init__(self):
         """Initialize the audio processor with configuration, models, and state."""
         
-        models = WhisperLiveKit()
+        self.kit_instance = WhisperLiveKit() # Get the singleton WhisperLiveKit instance
         
         # Generate a unique client ID for this processor instance
         self.client_id = str(uuid.uuid4())
         
         # Audio processing settings
-        self.args = models.args
+        self.args = self.kit_instance.args
         self.sample_rate = 16000
         self.channels = 1
         self.samples_per_sec = int(self.sample_rate * self.args.min_chunk_size)
@@ -63,25 +68,101 @@ class AudioProcessor:
         self.last_response_content = ""
         
         # Models and processing
-        self.asr = models.asr
-        self.tokenizer = models.tokenizer
-        self.diarization = models.diarization
-        self.batch_service = models.batch_service  # Use the shared batch service
+        # These will be set by assign_service()
+        self.asr = None
+        self.tokenizer = None
+        self.assigned_batch_service = None 
+        self.online = None # Will be initialized in assign_service
+
+        # Diarization can be taken from the kit_instance directly if it's global
+        self.diarization = self.kit_instance.diarization
+
         self.ffmpeg_process = self.start_ffmpeg_decoder()
         self.transcription_queue = asyncio.Queue(maxsize=10) if self.args.transcription else None
         self.diarization_queue = asyncio.Queue(maxsize=10) if self.args.diarization else None
         self.pcm_buffer = bytearray()
         
-        # Initialize transcription engine if enabled
-        if self.args.transcription:
-            self.online = online_factory(self.args, models.asr, models.tokenizer)
-            
         # Performance optimizations
         self.use_parallel = True  # Enable parallel processing
         self.max_update_freq = 0.2  # Maximum update frequency in seconds
         self.last_update = 0
 
-        logger.info(f"AudioProcessor initialized with client_id: {self.client_id}")
+        logger.info(f"AudioProcessor initialized with client_id: {self.client_id}. Waiting for service assignment.")
+
+    async def assign_service(self):
+        """Assigns a suitable BatchTranscriptionService to this AudioProcessor."""
+        assigned = False
+        while not assigned:
+            async with AudioProcessor._clients_per_service_lock:
+                for service in self.kit_instance.batch_services:
+                    current_clients = AudioProcessor._clients_per_service.get(service, 0)
+                    if current_clients < AudioProcessor.MAX_CLIENTS_PER_INSTANCE:
+                        # Tentatively assign the service to get its ASR/tokenizer
+                        # self.assigned_batch_service = service # Assign later only on full success
+                        _asr, _tokenizer = self.kit_instance.get_asr_and_tokenizer(service)
+
+                        transcription_requirements_met = False
+                        if self.args.transcription:
+                            if _asr:  # ASR is always needed for transcription
+                                if self.args.backend == "faster-whisper":
+                                    transcription_requirements_met = True  # Assume faster-whisper ASR handles tokenization or online_factory adapts
+                                    if not _tokenizer:
+                                        logger.info(f"Client {self.client_id}: For faster-whisper backend, tokenizer from backend_factory is None. This is assumed to be handled by online_factory.")
+                                elif _tokenizer:  # For other backends, tokenizer must be present
+                                    transcription_requirements_met = True
+                        else:  # Transcription is not enabled by args
+                            transcription_requirements_met = True # No ASR/tokenizer needed for transcription part if transcription is off
+
+                        if not transcription_requirements_met:
+                            logger.error(f"Client {self.client_id}: Failed to meet transcription requirements for service with backend {self.args.backend}. ASR: {'OK' if _asr else 'Missing'}, Tokenizer: {'OK' if _tokenizer else 'Missing'}. Trying next service or retrying.")
+                            # self.assigned_batch_service = None # Ensure it's cleared if we had tentatively set it
+                            continue # Try next service in the for loop
+                        
+                        # If we reach here, requirements are met for this service
+                        self.assigned_batch_service = service # Confirm assignment
+                        AudioProcessor._clients_per_service[service] = current_clients + 1
+                        self.asr = _asr
+                        self.tokenizer = _tokenizer # This might be None for faster-whisper
+                        assigned = True
+                        logger.info(f"Client {self.client_id} assigned to BatchService. Service now has {AudioProcessor._clients_per_service[service]} clients. Backend: {self.args.backend}, ASR: OK, Tokenizer: {'OK' if self.tokenizer else 'None/Handled by backend'}.")
+                        break # Exit the for loop (found a service)
+                # End of for loop (iterating through services)
+            # End of async with lock
+
+            if not assigned:
+                logger.warning(f"Client {self.client_id}: All ASR instances are currently at max capacity ({AudioProcessor.MAX_CLIENTS_PER_INSTANCE} clients) or failed to meet ASR/Tokenizer requirements for any available service. Waiting...")
+                await asyncio.sleep(1) # Wait and retry
+
+        # Initialize the online ASR engine if transcription is enabled and ASR is available
+        if self.args.transcription and self.asr:
+            # self.tokenizer might be None here if backend is faster-whisper and it returned None
+            self.online = online_factory(self.args, self.asr, self.tokenizer)
+            if self.online:
+                logger.info(f"Client {self.client_id}: Online ASR engine initialized successfully for backend {self.args.backend} with ASR and Tokenizer ({'Present' if self.tokenizer else 'None/Handled by backend'}).")
+            else:
+                logger.error(f"Client {self.client_id}: online_factory failed to initialize for backend {self.args.backend}. This is critical for transcription.")
+        elif self.args.transcription and not self.asr:
+            logger.error(f"Client {self.client_id}: Online ASR engine NOT initialized because self.asr is missing, despite transcription being enabled.")
+        else:
+            logger.info(f"Client {self.client_id}: Transcription is disabled by arguments. Online ASR engine not initialized.")
+
+    def release_service(self):
+        """Releases the BatchTranscriptionService when client disconnects."""
+        async def _release_service_async():
+            if self.assigned_batch_service:
+                async with AudioProcessor._clients_per_service_lock:
+                    if self.assigned_batch_service in AudioProcessor._clients_per_service:
+                        AudioProcessor._clients_per_service[self.assigned_batch_service] -= 1
+                        logger.info(f"Client {self.client_id} released BatchService. Service now has {AudioProcessor._clients_per_service[self.assigned_batch_service]} clients.")
+                        if AudioProcessor._clients_per_service[self.assigned_batch_service] == 0:
+                            del AudioProcessor._clients_per_service[self.assigned_batch_service]
+                    else:
+                        logger.warning(f"Client {self.client_id}: Tried to release a service not in the tracking dict.")
+                self.assigned_batch_service = None
+                self.asr = None
+                self.tokenizer = None
+        # Run this in a new task to avoid blocking if called from a sync context or during cleanup
+        asyncio.create_task(_release_service_async())
 
     def convert_pcm_to_float(self, pcm_buffer):
         """Convert PCM buffer in s16le format to normalized NumPy array."""
@@ -282,71 +363,83 @@ class AudioProcessor:
                 logger.warning(f"Traceback: {traceback.format_exc()}")
                 break
 
+# In whisperlivekit/audio_processor.py
+
+# ...existing code...
+
     async def transcription_processor(self):
         """Process audio chunks for transcription with optimized handling."""
+        if not self.args.transcription or not self.online: # Removed check for self.assigned_batch_service here as we'll primarily use self.online
+            logger.warning(f"Client {self.client_id}: Transcription processor cannot start. Transcription disabled or ASR (self.online) not initialized.")
+            return
+
         self.full_transcription = ""
-        self.sep = self.online.asr.sep
+        # Ensure self.online and self.online.asr are valid before accessing sep
+        if hasattr(self.online, 'asr') and self.online.asr is not None:
+            self.sep = self.online.asr.sep
+        else:
+            logger.error(f"Client {self.client_id}: self.online.asr is not available. Cannot determine separator. Defaulting to space.")
+            self.sep = " " # Default separator if ASR object isn't where expected
         
         while True:
             try:
                 pcm_array = await self.transcription_queue.get()
                 
-                # If using batch service, submit to it
-                if self.batch_service and hasattr(self.batch_service, 'submit'):
+                # Primarily use the self.online object for streaming transcription
+                # This logic is similar to _process_transcription_locally
+                def process_streaming_transcription_in_thread():
                     try:
-                        # Submit to batch service and get results
-                        batch_result = await self.batch_service.submit(self.client_id, pcm_array)
-                        
-                        # Process the results if valid
-                        if batch_result and not batch_result.get("error"):
-                            segments = batch_result.get("segments", [])
-                            tokens = batch_result.get("tokens", [])
-                            
-                            # Process the tokens and update state
-                            if tokens:
-                                # Insert audio chunk into online ASR (needed for buffer management)
-                                self.online.insert_audio_chunk(pcm_array)
-                                
-                                # Update with tokens from batch processing instead
-                                # of using self.online.process_iter()
-                                new_tokens = tokens
-                                
-                                if new_tokens:
-                                    self.full_transcription += self.sep.join([t.text for t in new_tokens])
-                                
-                                # Get buffer information
-                                _buffer = self.online.get_buffer()
-                                buffer = _buffer.text
-                                end_buffer = _buffer.end if _buffer.end else (
-                                    new_tokens[-1].end if new_tokens else 0
-                                )
-                                
-                                # Avoid duplicating content
-                                if buffer in self.full_transcription:
-                                    buffer = ""
-                                    
-                                await self.update_transcription(
-                                    new_tokens, buffer, end_buffer, self.full_transcription, self.sep
-                                )
-                        else:
-                            # Fall back to regular processing if batch processing failed
-                            logger.warning(f"Batch processing error: {batch_result.get('error', 'Unknown error')}")
-                            await self._process_transcription_locally(pcm_array)
+                        # Ensure self.online is still valid
+                        if not self.online:
+                            logger.warning(f"Client {self.client_id}: self.online became None during processing.")
+                            return []
+                        self.online.insert_audio_chunk(pcm_array)
+                        return self.online.process_iter()
                     except Exception as e:
-                        logger.error(f"Error in batch transcription: {e}")
+                        logger.error(f"Client {self.client_id}: Error in streaming transcription thread (process_iter): {e}")
                         logger.error(traceback.format_exc())
-                        # Fall back to local processing
-                        await self._process_transcription_locally(pcm_array)
+                        return []
+
+                new_tokens = await asyncio.get_event_loop().run_in_executor(
+                    thread_pool, process_streaming_transcription_in_thread
+                )
+
+                if new_tokens:
+                    self.full_transcription += self.sep.join([t.text for t in new_tokens])
+                    logger.debug(f"Client {self.client_id}: Received {len(new_tokens)} new tokens from self.online.process_iter().")
+                # No "else" here for logging 0 tokens, as process_iter might yield empty list between segments.
+
+                # Get buffer information from self.online
+                _buffer = self.online.get_buffer() if self.online else None
+                buffer_text = _buffer.text if _buffer else ""
+                
+                # Determine end_buffer: use new token's end, else buffer's end, else keep previous self.end_buffer
+                if new_tokens:
+                    current_segment_end_time = new_tokens[-1].end
+                elif _buffer and _buffer.end:
+                    current_segment_end_time = _buffer.end
                 else:
-                    # Use regular processing if batch service is not available
-                    await self._process_transcription_locally(pcm_array)
+                    current_segment_end_time = self.end_buffer 
+
+                # Avoid duplicating buffer text if it's already at the end of full_transcription
+                if buffer_text and self.full_transcription.endswith(buffer_text):
+                    buffer_text = ""
+            
+                await self.update_transcription(
+                    new_tokens if new_tokens is not None else [], # Ensure new_tokens is a list
+                    buffer_text, 
+                    current_segment_end_time, 
+                    self.full_transcription, 
+                    self.sep
+                )
                 
             except Exception as e:
-                logger.warning(f"Exception in transcription_processor: {e}")
+                logger.warning(f"Client {self.client_id}: Exception in transcription_processor main loop: {e}")
                 logger.warning(f"Traceback: {traceback.format_exc()}")
             finally:
-                self.transcription_queue.task_done()
-                
+                if hasattr(self.transcription_queue, 'task_done'):
+                    self.transcription_queue.task_done()
+
     async def _process_transcription_locally(self, pcm_array):
         """Process transcription locally without batch service"""
         # Perform CPU-intensive transcription in thread pool
@@ -557,6 +650,9 @@ class AudioProcessor:
         
     async def create_tasks(self):
         """Create and start processing tasks with improved task management."""
+        
+        # Ensure service is assigned before creating tasks that depend on ASR/tokenizer
+        await self.assign_service()
             
         tasks = []    
         if self.args.transcription and self.online:
@@ -609,7 +705,8 @@ class AudioProcessor:
         
     async def cleanup(self):
         """Clean up resources when processing is complete."""
-        for task in self.tasks:
+        self.release_service() # Release the service slot
+        for task in getattr(self, 'tasks', []):
             task.cancel()
             
         try:

@@ -19,7 +19,7 @@ class HypothesisBuffer:
     """
     def __init__(self, logfile=sys.stderr, confidence_validation=False):
         self.confidence_validation = confidence_validation
-        self.commited_in_buffer: List[ASRToken] = []
+        self.committed_in_buffer: List[ASRToken] = []
         self.buffer: List[ASRToken] = []
         self.new: List[ASRToken] = []
         self.last_committed_time = 0.0
