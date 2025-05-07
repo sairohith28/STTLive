@@ -358,20 +358,20 @@ class OnlineASRProcessor:
         
         logger.debug("Segment chunking complete")
 
-    def chunk_at(self, time: float):
+    def chunk_at(self, chunk_timestamp: float):
         """
         Trim both the hypothesis and audio buffer at the given time.
         """
-        logger.debug(f"Chunking at {time:.2f}s")
+        logger.debug(f"Chunking at {chunk_timestamp:.2f}s")
         logger.debug(
             f"Audio buffer length before chunking: {len(self.audio_buffer)/self.SAMPLING_RATE:.2f}s"
         )
-        self.transcript_buffer.pop_committed(time)
-        cut_seconds = time - self.buffer_time_offset
+        self.transcript_buffer.pop_committed(chunk_timestamp)
+        cut_seconds = chunk_timestamp - self.buffer_time_offset
         
         # Safety check to prevent bad trimming
         if cut_seconds <= 0 or cut_seconds >= len(self.audio_buffer)/self.SAMPLING_RATE:
-            logger.warning(f"Invalid chunk point {time:.2f}s, offset: {self.buffer_time_offset:.2f}s")
+            logger.warning(f"Invalid chunk point {chunk_timestamp:.2f}s, offset: {self.buffer_time_offset:.2f}s")
             # If invalid, just trim a safe amount
             safe_trim = min(len(self.audio_buffer) // 2, int(self.SAMPLING_RATE * 5))
             if safe_trim > 0:
@@ -380,7 +380,7 @@ class OnlineASRProcessor:
         else:
             trim_samples = int(cut_seconds * self.SAMPLING_RATE)
             self.audio_buffer = self.audio_buffer[trim_samples:]
-            self.buffer_time_offset = time
+            self.buffer_time_offset = chunk_timestamp
             
         logger.debug(
             f"Audio buffer length after chunking: {len(self.audio_buffer)/self.SAMPLING_RATE:.2f}s"
