@@ -106,6 +106,7 @@ celerybeat.pid
 .venv
 env/
 live-transcribe/
+old/
 venv/
 ENV/
 env.bak/

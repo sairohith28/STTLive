@@ -514,19 +514,59 @@ class OpenaiApiASR(ASRBase):
 
 
 class ParakeetTDTASR(ASRBase):
-    """Uses NVIDIA's Parakeet TDT model as the backend using Hugging Face Transformers."""
-    sep = ""
+    """Uses NVIDIA's Parakeet TDT model as the backend through NeMo toolkit."""
+    sep = " "  # Changed from empty string to space for proper word separation
+
+    def __init__(self, lan=None, modelsize=None, cache_dir=None, model_dir=None, logfile=sys.stderr):
+        # Call parent's init but keep our own parameters
+        super().__init__(lan, modelsize, cache_dir, model_dir, logfile)
+        
+        # Add a basic sentence tokenizer for when using "sentence" buffer trimming mode
+        self.tokenizer = self._create_basic_tokenizer()
+        
+    def _create_basic_tokenizer(self):
+        """Create a simple tokenizer for sentence segmentation since Parakeet TDT doesn't provide one"""
+        class BasicTokenizer:
+            def split(self, text):
+                # Simple regex-based sentence splitting
+                import re
+                text = text.strip()
+                # Split on common sentence endings (period, question mark, exclamation mark) followed by space
+                sentences = re.split(r'(?<=[.!?])\s+', text)
+                return [s for s in sentences if s.strip()]  # Remove empty strings
+                
+        return BasicTokenizer()
 
     def load_model(self, modelsize=None, cache_dir=None, model_dir=None):
         try:
-            from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
-            import os
+            # First, try to properly import NeMo
+            try:
+                import nemo.collections.asr as nemo_asr
+                logger.info("Successfully imported NVIDIA NeMo toolkit")
+            except ImportError:
+                logger.error("NVIDIA NeMo toolkit is not installed. Installing required packages...")
+                
+                # Try to install NeMo dependencies
+                import subprocess
+                import sys
+                
+                # Install minimal dependencies needed for inference
+                subprocess.check_call([sys.executable, "-m", "pip", "install", 
+                                      "nemo_toolkit[asr]>=2.0.0", "--no-deps"])
+                subprocess.check_call([sys.executable, "-m", "pip", "install", 
+                                      "torch>=2.0.0", "torchvision", "torchaudio"])
+                
+                # Try to import again after installation
+                import nemo.collections.asr as nemo_asr
+                logger.info("Successfully installed and imported NVIDIA NeMo toolkit")
             
             # Set model name for Parakeet TDT
             model_name = "nvidia/parakeet-tdt-0.6b-v2"
             if modelsize and modelsize.startswith("nvidia/parakeet"):
                 model_name = modelsize
-            
+            # model_name = "nvidia/canary-1b-flash"
+            # if modelsize and modelsize.startswith("nvidia/canary"):
+            #     model_name = modelsize
             logger.info(f"Loading Parakeet TDT model: {model_name}")
             
             # Clear CUDA cache before loading model if using GPU
@@ -542,70 +582,101 @@ class ParakeetTDTASR(ASRBase):
                 except Exception as e:
                     logger.warning(f"Could not check GPU memory: {e}")
             
-            # Set device
-            device = "cuda" if torch and torch.cuda.is_available() else "cpu"
-            logger.info(f"Using device: {device}")
+            # Load model directly from NeMo hub
+            logger.info(f"Attempting to load model {model_name} from NeMo hub")
+            self.device = "cuda" if torch and torch.cuda.is_available() else "cpu"
             
-            # Load the model from HuggingFace Hub
-            processor = AutoProcessor.from_pretrained(model_name)
-            model = AutoModelForSpeechSeq2Seq.from_pretrained(
-                model_name,
-                torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-                low_cpu_mem_usage=True,
-                use_safetensors=True,
+            # Load the model from NeMo hub
+            # NeMo doesn't accept cache_dir parameter, so we don't pass it
+            model = nemo_asr.models.ASRModel.from_pretrained(
+                model_name=model_name
             )
             
-            if device == "cuda":
-                model = model.to(device)
+            if torch.cuda.is_available():
+                model = model.cuda()
             
-            # Record model information for reference
+            # Store model information
             self.model = model
-            self.processor = processor
             self.model_size = model_name
-            self.device = device
             
-            logger.info(f"Successfully loaded Parakeet TDT model on {device}")
+            logger.info(f"Successfully loaded Parakeet TDT model on {self.device}")
             return model
             
         except Exception as e:
             logger.error(f"Failed to load Parakeet TDT model: {e}")
+            
+            # Fallback to a Whisper model if Parakeet fails
+            try:
+                logger.warning("Falling back to Whisper model...")
+                from faster_whisper import WhisperModel
+                
+                fallback_model = "large-v3"
+                logger.info(f"Loading fallback Whisper model: {fallback_model}")
+                
+                # Configure device and compute type
+                device = "cuda" if torch and torch.cuda.is_available() else "cpu"
+                compute_type = "float16" if device == "cuda" else "int8"
+                
+                # Load the model
+                model = WhisperModel(
+                    fallback_model,
+                    device=device,
+                    compute_type=compute_type,
+                    download_root=cache_dir
+                )
+                
+                # Record information about the fallback model
+                self.model = model
+                self.fallback = True
+                self.model_size = fallback_model
+                self.device = device
+                
+                logger.info(f"Successfully loaded fallback Whisper model on {device}")
+                return model
+            except Exception as fallback_error:
+                logger.error(f"Failed to load fallback model: {fallback_error}")
+                raise RuntimeError(f"Failed to load Parakeet TDT model: {e}. Fallback also failed: {fallback_error}")
+            
             raise RuntimeError(f"Failed to load Parakeet TDT model: {e}")
 
     def transcribe(self, audio: np.ndarray, init_prompt: str = "") -> list:
         """
-        Transcribe audio using the Parakeet TDT model via Transformers.
+        Transcribe audio using the Parakeet TDT model.
         """
         try:
-            import torch
-            
-            # Prepare the input features
-            input_features = self.processor(
-                audio, 
-                sampling_rate=16000, 
-                return_tensors="pt"
-            ).input_features
-            
-            if self.device == "cuda":
-                input_features = input_features.to(self.device)
-            
-            # Generate transcription with timestamps
-            with torch.no_grad():
-                forced_decoder_ids = self.processor.get_decoder_prompt_ids(
-                    language=self.original_language if self.original_language else "en", 
-                    task="transcribe",
-                    return_timestamps=True
+            # Check if we're using the fallback model
+            if hasattr(self, 'fallback') and self.fallback:
+                # Using faster-whisper fallback
+                segments, _ = self.model.transcribe(
+                    audio,
+                    language=self.original_language,
+                    initial_prompt=init_prompt,
+                    word_timestamps=True
                 )
-                
-                outputs = self.model.generate(
-                    input_features,
-                    forced_decoder_ids=forced_decoder_ids,
-                    max_new_tokens=256,
-                    return_timestamps=True
-                )
+                return list(segments)
             
-            # Process the output tokens into text with timestamps
-            result = self.processor.batch_decode(outputs, skip_special_tokens=False)
-            segments = self._process_parakeet_result(result[0], audio)
+            # Create a temporary WAV file to use with NeMo
+            import tempfile
+            import soundfile as sf
+            import os
+            
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_audio:
+                temp_path = temp_audio.name
+            
+            # Save the audio to the temporary file
+            sf.write(temp_path, audio, samplerate=16000, format='WAV', subtype='PCM_16')
+            
+            # Transcribe with timestamps
+            result = self.model.transcribe([temp_path], timestamps=True)
+            
+            # Clean up temp file
+            try:
+                os.unlink(temp_path)
+            except Exception as e:
+                logger.warning(f"Failed to delete temporary file {temp_path}: {e}")
+            
+            # Process the result into segments
+            segments = self._process_nemo_result(result[0])
             
             return segments
             
@@ -614,10 +685,9 @@ class ParakeetTDTASR(ASRBase):
             # Return empty result on error
             return []
 
-    def _process_parakeet_result(self, result_text, audio):
-        """Process the raw Parakeet TDT output into segments with timestamps."""
+    def _process_nemo_result(self, result):
+        """Process the NeMo result into segments with word timestamps."""
         from dataclasses import dataclass
-        import re
         
         @dataclass
         class Segment:
@@ -636,53 +706,58 @@ class ParakeetTDTASR(ASRBase):
         
         segments = []
         
-        # Parse the timestamps and text using regex
-        # Parakeet TDT outputs format: "<0.0> text <1.2> more text <2.3>"
-        timestamp_pattern = r'<(\d+\.\d+)>'
+        # Extract segment-level timestamps
+        if hasattr(result, 'timestamp') and 'segment' in result.timestamp:
+            for stamp in result.timestamp['segment']:
+                segment_text = stamp['segment']
+                segment_start = stamp['start']
+                segment_end = stamp['end']
+                
+                # Find all words in this segment
+                words = []
+                if hasattr(result, 'timestamp') and 'word' in result.timestamp:
+                    for word_stamp in result.timestamp['word']:
+                        if (word_stamp['start'] >= segment_start and 
+                            word_stamp['end'] <= segment_end):
+                            words.append(
+                                Word(
+                                    start=word_stamp['start'],
+                                    end=word_stamp['end'],
+                                    word=word_stamp['word']
+                                )
+                            )
+                
+                segment = Segment(
+                    start=segment_start,
+                    end=segment_end,
+                    text=segment_text,
+                    words=words
+                )
+                segments.append(segment)
         
-        # Extract timestamps and text segments
-        timestamps = [float(t) for t in re.findall(timestamp_pattern, result_text)]
-        text_segments = re.split(timestamp_pattern, result_text)
-        text_segments = [s.strip() for s in text_segments if s.strip() and not s.strip().replace('.', '').isdigit()]
-        
-        if len(timestamps) >= 2 and text_segments:
-            for i in range(len(text_segments)):
-                if i+1 < len(timestamps):
-                    start_time = timestamps[i]
-                    end_time = timestamps[i+1]
-                    text = text_segments[i]
-                    
-                    # Create word-level timestamps by dividing the segment
-                    words = []
-                    if text:
-                        word_list = text.split()
-                        if word_list:
-                            duration = end_time - start_time
-                            word_duration = duration / len(word_list)
-                            
-                            for j, word in enumerate(word_list):
-                                word_start = start_time + j * word_duration
-                                word_end = word_start + word_duration
-                                words.append(Word(start=word_start, end=word_end, word=word))
-                    
-                    segment = Segment(
-                        start=start_time,
-                        end=end_time,
-                        text=text,
-                        words=words
+        # If no segments, create one with the full text
+        if not segments and hasattr(result, 'text'):
+            # Use word timestamps if available
+            words = []
+            if hasattr(result, 'timestamp') and 'word' in result.timestamp:
+                for word_stamp in result.timestamp['word']:
+                    words.append(
+                        Word(
+                            start=word_stamp['start'],
+                            end=word_stamp['end'],
+                            word=word_stamp['word']
+                        )
                     )
-                    segments.append(segment)
-        
-        # If no segments were created but we have text, create a default segment
-        if not segments and text_segments:
-            full_text = " ".join(text_segments)
-            audio_duration = len(audio) / 16000
+            
+            # Use the full duration if we have words
+            start_time = words[0].start if words else 0.0
+            end_time = words[-1].end if words else 10.0  # Default 10s if unknown
             
             segment = Segment(
-                start=0.0,
-                end=audio_duration,
-                text=full_text,
-                words=[]
+                start=start_time,
+                end=end_time,
+                text=result.text,
+                words=words
             )
             segments.append(segment)
         
@@ -692,14 +767,53 @@ class ParakeetTDTASR(ASRBase):
         """Process a batch of audio samples."""
         results = []
         
-        # Process each audio sample individually
-        for audio in audio_batch:
-            segments = self.transcribe(audio)
-            results.append({
-                "segments": segments,
-                "tokens": self.ts_words(segments)
-            })
+        # Check if we're using the fallback model
+        if hasattr(self, 'fallback') and self.fallback:
+            # Process in small batches to avoid memory issues
+            for audio in audio_batch:
+                segments = self.transcribe(audio)
+                results.append({
+                    "segments": segments,
+                    "tokens": self.ts_words(segments)
+                })
+            return results
         
+        # Using NeMo model - process through temporary files
+        import tempfile
+        import soundfile as sf
+        import os
+        
+        try:
+            # Create temporary WAV files for batch processing
+            temp_files = []
+            for i, audio in enumerate(audio_batch):
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_audio:
+                    temp_path = temp_audio.name
+                    temp_files.append(temp_path)
+                    sf.write(temp_path, audio, samplerate=16000, format='WAV', subtype='PCM_16')
+            
+            # Transcribe all files in one batch
+            batch_results = self.model.transcribe(temp_files, timestamps=True)
+            
+            # Process each result and add to results list
+            for i, result in enumerate(batch_results):
+                segments = self._process_nemo_result(result)
+                results.append({
+                    "segments": segments,
+                    "tokens": self.ts_words(segments)
+                })
+                
+                # Delete temporary file
+                try:
+                    os.unlink(temp_files[i])
+                except Exception as e:
+                    logger.warning(f"Failed to delete temporary file {temp_files[i]}: {e}")
+            
+        except Exception as e:
+            logger.error(f"Error in batch transcription: {e}")
+            # Return empty results
+            results = [{"segments": [], "tokens": []}] * len(audio_batch)
+            
         return results
 
     def ts_words(self, segments) -> List[ASRToken]:
@@ -716,10 +830,10 @@ class ParakeetTDTASR(ASRBase):
         return [segment.end for segment in segments]
 
     def use_vad(self):
-        """VAD is built into the model's preprocessing."""
+        """VAD is built into Parakeet TDT model."""
         self.transcribe_kargs["vad_filter"] = True
 
     def set_translate_task(self):
-        """Set to translation mode if supported."""
-        logger.warning("Translation not fully supported by Parakeet TDT model, but will attempt to use translation mode")
+        """Set task to translation if supported."""
+        logger.warning("Translation not supported by Parakeet TDT model, ignoring.")
         self.transcribe_kargs["task"] = "translate"

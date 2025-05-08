@@ -104,10 +104,10 @@ class AudioProcessor:
                         transcription_requirements_met = False
                         if self.args.transcription:
                             if _asr:  # ASR is always needed for transcription
-                                if self.args.backend == "faster-whisper":
-                                    transcription_requirements_met = True  # Assume faster-whisper ASR handles tokenization or online_factory adapts
+                                if self.args.backend == "faster-whisper" or self.args.backend == "parakeet-tdt":
+                                    transcription_requirements_met = True  # Assume these backends handle tokenization or online_factory adapts
                                     if not _tokenizer:
-                                        logger.info(f"Client {self.client_id}: For faster-whisper backend, tokenizer from backend_factory is None. This is assumed to be handled by online_factory.")
+                                        logger.info(f"Client {self.client_id}: For {self.args.backend} backend, tokenizer from backend_factory is None. This is assumed to be handled by online_factory.")
                                 elif _tokenizer:  # For other backends, tokenizer must be present
                                     transcription_requirements_met = True
                         else:  # Transcription is not enabled by args
