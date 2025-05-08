@@ -144,7 +144,7 @@ class FasterWhisperASR(ASRBase):
         if "tiny" in str(model_size_or_path).lower() or "base" in str(model_size_or_path).lower():
             beam_size = 2  # Faster for small models
         elif "large" in str(model_size_or_path).lower() or "distil" in str(model_size_or_path).lower():
-            beam_size = 4  # Better accuracy for large models
+            beam_size = 3  # Better accuracy for large models
         
         # Advanced configuration with adaptive parameters
         best_of = None  # Default from faster-whisper
@@ -561,12 +561,12 @@ class ParakeetTDTASR(ASRBase):
                 logger.info("Successfully installed and imported NVIDIA NeMo toolkit")
             
             # Set model name for Parakeet TDT
-            model_name = "nvidia/parakeet-tdt-0.6b-v2"
-            if modelsize and modelsize.startswith("nvidia/parakeet"):
-                model_name = modelsize
-            # model_name = "nvidia/canary-1b-flash"
-            # if modelsize and modelsize.startswith("nvidia/canary"):
+            # model_name = "nvidia/parakeet-tdt-0.6b-v2"
+            # if modelsize and modelsize.startswith("nvidia/parakeet"):
             #     model_name = modelsize
+            model_name = "nvidia/stt_en_fastconformer_transducer_large"
+            if modelsize and modelsize.startswith("nvidia/canary"):
+                model_name = modelsize
             logger.info(f"Loading Parakeet TDT model: {model_name}")
             
             # Clear CUDA cache before loading model if using GPU
@@ -666,17 +666,28 @@ class ParakeetTDTASR(ASRBase):
             # Save the audio to the temporary file
             sf.write(temp_path, audio, samplerate=16000, format='WAV', subtype='PCM_16')
             
-            # Transcribe with timestamps
-            result = self.model.transcribe([temp_path], timestamps=True)
+            # Try transcribing with timestamps first
+            try:
+                result = self.model.transcribe([temp_path], timestamps=True)
+                # Process the result directly without calling _process_nemo_result
+                segments = self._create_segments_from_nemo_result(result[0])
+                
+            except Exception as timestamp_error:
+                if "timestamps are not supported" in str(timestamp_error):
+                    logger.info(f"Model {self.model_size} doesn't support timestamps. Using fallback approach with approximate timestamps.")
+                    # Transcribe without timestamps
+                    result = self.model.transcribe([temp_path])
+                    # Generate synthetic timestamps
+                    segments = self._generate_synthetic_timestamps(result[0])
+                else:
+                    # Different error, re-raise
+                    raise
             
             # Clean up temp file
             try:
                 os.unlink(temp_path)
             except Exception as e:
                 logger.warning(f"Failed to delete temporary file {temp_path}: {e}")
-            
-            # Process the result into segments
-            segments = self._process_nemo_result(result[0])
             
             return segments
             
@@ -685,8 +696,8 @@ class ParakeetTDTASR(ASRBase):
             # Return empty result on error
             return []
 
-    def _process_nemo_result(self, result):
-        """Process the NeMo result into segments with word timestamps."""
+    def _create_segments_from_nemo_result(self, result):
+        """Create segments from NeMo result - replaces _process_nemo_result."""
         from dataclasses import dataclass
         
         @dataclass
@@ -703,61 +714,111 @@ class ParakeetTDTASR(ASRBase):
             end: float
             word: str
             probability: float = 0.9
-        
+            
         segments = []
         
-        # Extract segment-level timestamps
-        if hasattr(result, 'timestamp') and 'segment' in result.timestamp:
-            for stamp in result.timestamp['segment']:
-                segment_text = stamp['segment']
-                segment_start = stamp['start']
-                segment_end = stamp['end']
-                
-                # Find all words in this segment
-                words = []
-                if hasattr(result, 'timestamp') and 'word' in result.timestamp:
-                    for word_stamp in result.timestamp['word']:
-                        if (word_stamp['start'] >= segment_start and 
-                            word_stamp['end'] <= segment_end):
-                            words.append(
-                                Word(
-                                    start=word_stamp['start'],
-                                    end=word_stamp['end'],
-                                    word=word_stamp['word']
-                                )
-                            )
-                
-                segment = Segment(
-                    start=segment_start,
-                    end=segment_end,
-                    text=segment_text,
-                    words=words
-                )
-                segments.append(segment)
+        # Check if results exist and have text
+        if not hasattr(result, 'text') or not result.text:
+            return segments
         
-        # If no segments, create one with the full text
-        if not segments and hasattr(result, 'text'):
-            # Use word timestamps if available
-            words = []
-            if hasattr(result, 'timestamp') and 'word' in result.timestamp:
-                for word_stamp in result.timestamp['word']:
-                    words.append(
-                        Word(
-                            start=word_stamp['start'],
-                            end=word_stamp['end'],
-                            word=word_stamp['word']
-                        )
-                    )
-            
-            # Use the full duration if we have words
-            start_time = words[0].start if words else 0.0
-            end_time = words[-1].end if words else 10.0  # Default 10s if unknown
-            
+        # Extract word timestamps if available
+        words = []
+        if hasattr(result, 'timestamp') and 'word' in result.timestamp:
+            for word_stamp in result.timestamp['word']:
+                word = Word(
+                    start=word_stamp['start'],
+                    end=word_stamp['end'],
+                    word=word_stamp['word'],
+                    probability=0.9  # Default confidence
+                )
+                words.append(word)
+        
+        # If we have words with timestamps
+        if words:
+            # Create a segment with all the words
             segment = Segment(
-                start=start_time,
-                end=end_time,
+                start=words[0].start,
+                end=words[-1].end,
                 text=result.text,
                 words=words
+            )
+            segments.append(segment)
+        else:
+            # If no word timestamps, create a segment with estimated duration
+            audio_duration = getattr(result, 'duration', 5.0)  # Default 5 seconds if unknown
+            segment = Segment(
+                start=0.0,
+                end=audio_duration,
+                text=result.text,
+                words=[]  # No word-level timestamps
+            )
+            segments.append(segment)
+        
+        return segments
+
+    def _generate_synthetic_timestamps(self, result):
+        """Generate synthetic timestamps for models that don't support them."""
+        from dataclasses import dataclass
+        import re
+        
+        @dataclass
+        class Segment:
+            start: float
+            end: float
+            text: str
+            words: list
+            no_speech_prob: float = 0.0
+            
+        @dataclass
+        class Word:
+            start: float
+            end: float
+            word: str
+            probability: float = 0.9
+            
+        segments = []
+        
+        if not hasattr(result, 'text') or not result.text:
+            return segments
+            
+        # Split text into tokens/words
+        text = result.text.strip()
+        words = re.findall(r'\S+|\s+', text)
+        
+        # Filter out whitespace-only tokens
+        words = [w for w in words if w.strip()]
+        
+        # Calculate approximate duration
+        audio_duration = getattr(result, 'duration', len(words) * 0.3)  # Fallback to estimate if duration not available
+        
+        # Estimate word durations - average English word takes ~0.3 seconds to speak
+        # We'll distribute words evenly across the audio duration
+        avg_word_duration = audio_duration / max(1, len(words))
+        
+        # Create synthetic word timestamps
+        synthetic_words = []
+        current_time = 0.0
+        
+        for word_text in words:
+            # Adjust duration based on word length (longer words take more time)
+            word_duration = avg_word_duration * (0.5 + 0.5 * len(word_text) / 5)  # Adjust based on word length
+            
+            word = Word(
+                start=current_time,
+                end=current_time + word_duration,
+                word=word_text,
+                probability=0.9  # Default confidence
+            )
+            synthetic_words.append(word)
+            current_time += word_duration
+        
+        # Create a single segment containing all words
+        if synthetic_words:
+            segment = Segment(
+                start=0.0,
+                end=audio_duration,
+                text=text,
+                words=synthetic_words
             )
             segments.append(segment)
         
@@ -797,7 +858,7 @@ class ParakeetTDTASR(ASRBase):
             
             # Process each result and add to results list
             for i, result in enumerate(batch_results):
-                segments = self._process_nemo_result(result)
+                segments = self._create_segments_from_nemo_result(result)
                 results.append({
                     "segments": segments,
                     "tokens": self.ts_words(segments)

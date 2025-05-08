@@ -95,10 +95,12 @@ class AudioProcessor:
         while not assigned:
             async with AudioProcessor._clients_per_service_lock:
                 for service in self.kit_instance.batch_services:
-                    current_clients = AudioProcessor._clients_per_service.get(service, 0)
-                    if current_clients < AudioProcessor.MAX_CLIENTS_PER_INSTANCE:
+                    # Get the client IDs for this service (use an empty list as default)
+                    current_clients = AudioProcessor._clients_per_service.get(service, [])
+                    
+                    # Check if we have capacity (using the length of the client list)
+                    if len(current_clients) < AudioProcessor.MAX_CLIENTS_PER_INSTANCE:
                         # Tentatively assign the service to get its ASR/tokenizer
-                        # self.assigned_batch_service = service # Assign later only on full success
                         _asr, _tokenizer = self.kit_instance.get_asr_and_tokenizer(service)
 
                         transcription_requirements_met = False
@@ -115,16 +117,20 @@ class AudioProcessor:
 
                         if not transcription_requirements_met:
                             logger.error(f"Client {self.client_id}: Failed to meet transcription requirements for service with backend {self.args.backend}. ASR: {'OK' if _asr else 'Missing'}, Tokenizer: {'OK' if _tokenizer else 'Missing'}. Trying next service or retrying.")
-                            # self.assigned_batch_service = None # Ensure it's cleared if we had tentatively set it
                             continue # Try next service in the for loop
                         
                         # If we reach here, requirements are met for this service
                         self.assigned_batch_service = service # Confirm assignment
-                        AudioProcessor._clients_per_service[service] = current_clients + 1
+                        
+                        # Add this client ID to the list of clients for this service
+                        if service not in AudioProcessor._clients_per_service:
+                            AudioProcessor._clients_per_service[service] = []
+                        AudioProcessor._clients_per_service[service].append(self.client_id)
+                        
                         self.asr = _asr
                         self.tokenizer = _tokenizer # This might be None for faster-whisper
                         assigned = True
-                        logger.info(f"Client {self.client_id} assigned to BatchService. Service now has {AudioProcessor._clients_per_service[service]} clients. Backend: {self.args.backend}, ASR: OK, Tokenizer: {'OK' if self.tokenizer else 'None/Handled by backend'}.")
+                        logger.info(f"Client {self.client_id} assigned to BatchService. Service now has {len(AudioProcessor._clients_per_service[service])} clients. Backend: {self.args.backend}, ASR: OK, Tokenizer: {'OK' if self.tokenizer else 'None/Handled by backend'}.")
                         break # Exit the for loop (found a service)
                 # End of for loop (iterating through services)
             # End of async with lock
@@ -152,15 +158,22 @@ class AudioProcessor:
             if self.assigned_batch_service:
                 async with AudioProcessor._clients_per_service_lock:
                     if self.assigned_batch_service in AudioProcessor._clients_per_service:
-                        AudioProcessor._clients_per_service[self.assigned_batch_service] -= 1
-                        logger.info(f"Client {self.client_id} released BatchService. Service now has {AudioProcessor._clients_per_service[self.assigned_batch_service]} clients.")
-                        if AudioProcessor._clients_per_service[self.assigned_batch_service] == 0:
+                        # Remove this client from the list of clients for this service
+                        if self.client_id in AudioProcessor._clients_per_service[self.assigned_batch_service]:
+                            AudioProcessor._clients_per_service[self.assigned_batch_service].remove(self.client_id)
+                            logger.info(f"Client {self.client_id} released BatchService. Service now has {len(AudioProcessor._clients_per_service[self.assigned_batch_service])} clients.")
+                        
+                        # If the list is empty, remove the service from the dictionary
+                        if not AudioProcessor._clients_per_service[self.assigned_batch_service]:
                             del AudioProcessor._clients_per_service[self.assigned_batch_service]
                     else:
                         logger.warning(f"Client {self.client_id}: Tried to release a service not in the tracking dict.")
+                
+                # Clear our local references
                 self.assigned_batch_service = None
                 self.asr = None
                 self.tokenizer = None
+        
         # Run this in a new task to avoid blocking if called from a sync context or during cleanup
         asyncio.create_task(_release_service_async())
 
