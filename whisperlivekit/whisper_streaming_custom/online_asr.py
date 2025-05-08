@@ -19,7 +19,7 @@ class HypothesisBuffer:
     """
     def __init__(self, logfile=sys.stderr, confidence_validation=False):
         self.confidence_validation = confidence_validation
-        self.committed_in_buffer: List[ASRToken] = []
+        self.committed_in_buffer: List[ASRToken] = []  # Fixed spelling: commited -> committed
         self.buffer: List[ASRToken] = []
         self.new: List[ASRToken] = []
         self.last_committed_time = 0.0
@@ -583,25 +583,39 @@ class VACOnlineASRProcessor:
                 self.buffer_offset += max(0, len(self.audio_buffer) - self.SAMPLING_RATE)
                 self.audio_buffer = self.audio_buffer[-self.SAMPLING_RATE:]
 
-    def process_iter(self) -> Transcript:
+    def process_iter(self) -> List[ASRToken]:
         """
         Depending on the VAD status and the amount of accumulated audio,
         process the current audio chunk.
+        
+        Returns a list of ASRToken objects, not a Transcript object, to maintain
+        compatibility with the expected return type in AudioProcessor.
         """
         try:
             if self.is_currently_final:
                 result = self.finish()
-                return result
+                # Instead of returning Transcript object, return an empty list
+                # or convert the Transcript to a list with a single token
+                if result.text:
+                    # Create a single token with the text from the Transcript
+                    return [ASRToken(
+                        start=result.start if result.start is not None else 0,
+                        end=result.end if result.end is not None else 0,
+                        text=result.text
+                    )]
+                return []  # Empty list if no text
             elif self.current_online_chunk_buffer_size > self.SAMPLING_RATE * self.online_chunk_size:
                 self.current_online_chunk_buffer_size = 0
+                # This returns a list of tokens which is what we want
                 return self.online.process_iter()
             else:
                 logger.debug("No online update, only VAD")
-                return Transcript(None, None, "")
+                # Return empty list instead of Transcript object
+                return []
         except Exception as e:
             logger.error(f"Error in VAC process_iter: {e}")
-            # Return empty transcript on error
-            return Transcript(None, None, "")
+            # Return empty list on error
+            return []
 
     def finish(self) -> Transcript:
         """Finish processing by flushing any remaining text."""
