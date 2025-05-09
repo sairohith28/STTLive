@@ -114,7 +114,7 @@ class FasterWhisperASR(ASRBase):
         if torch:
             if torch.cuda.is_available():
                 device = "cuda"
-                compute_type = "float16"
+                compute_type = "float16"  # Default to float16 for CUDA
                 torch.cuda.empty_cache()  # Clear CUDA memory before loading model
                 
                 # Check available GPU memory and adjust settings accordingly
@@ -150,9 +150,9 @@ class FasterWhisperASR(ASRBase):
         best_of = None  # Default from faster-whisper
         if device == "cuda":
             # Use more threads on GPU for parallel processing
-            cpu_threads = 2
+            cpu_threads = 4
             # Use more workers for loading when GPU is available
-            num_workers = 3 if "large" not in str(model_size_or_path).lower() else 2
+            num_workers = 1 if "large" not in str(model_size_or_path).lower() else 2
         else:
             # Use more CPU threads when running on CPU
             cpu_threads = min(8, os.cpu_count() or 4)
