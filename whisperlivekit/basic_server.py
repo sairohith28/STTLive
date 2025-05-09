@@ -69,6 +69,61 @@ async def websocket_endpoint(websocket: WebSocket):
         await audio_processor.cleanup()
         logger.info("WebSocket endpoint cleaned up.")
 
+@app.get("/api/status")
+async def get_status():
+    """Returns the status of all ASR instances and client connections."""
+    global kit
+    
+    if not kit:
+        return {"error": "WhisperLiveKit not initialized"}
+    
+    # Get instance information
+    instances = []
+    for i, service in enumerate(kit.batch_services):
+        # Get clients connected to this service
+        clients = []
+        for client_id, client_service in AudioProcessor._clients_per_service.items():
+            if client_service == service:
+                clients.append(str(client_id))
+        
+        instance_info = {
+            "id": i,
+            "backend": kit.args.backend,
+            "model": kit.args.model if hasattr(kit.args, "model") else "unknown",
+            "clients_connected": len(clients),
+            "max_clients": AudioProcessor.MAX_CLIENTS_PER_INSTANCE,
+            "client_ids": clients
+        }
+        instances.append(instance_info)
+    
+    # Calculate total clients directly from the clients we gathered
+    total_clients = sum(len(instance_info["client_ids"]) for instance_info in instances)
+    
+    # Build the complete status response
+    status = {
+        "total_instances": len(kit.batch_services),
+        "total_clients": total_clients,
+        "max_clients_per_instance": AudioProcessor.MAX_CLIENTS_PER_INSTANCE,
+        "instances": instances,
+        "diarization_enabled": kit.args.diarization if hasattr(kit.args, "diarization") else False,
+    }
+    
+    return status
+
+@app.get("/monitor")
+async def get_monitor():
+    """Serves the monitoring interface HTML page."""
+    html_content = ""
+    monitor_path = "/home/musadiq/test/whisperlivekit/web/index.html"
+    
+    try:
+        with open(monitor_path, "r") as f:
+            html_content = f.read()
+    except FileNotFoundError:
+        return HTMLResponse(f"<html><body><h1>Error: Monitor page not found</h1><p>Could not find {monitor_path}</p></body></html>")
+    
+    return HTMLResponse(html_content)
+
 def main():
     """Entry point for the CLI command."""
     import uvicorn

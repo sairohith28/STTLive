@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WhisperLiveKit Monitor</title>
+    <meta http-equiv="refresh" content="5"> <!-- Fallback auto-refresh -->
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .instance { border: 1px solid #ddd; padding: 10px; margin: 10px 0; border-radius: 5px; }
+        .instance.full { background-color: #fff4f4; }
+        .stats { margin-bottom: 20px; background-color: #f5f5f5; padding: 10px; border-radius: 5px; }
+        .clients { margin-top: 10px; }
+        .client { padding: 5px; background: #eee; margin: 2px; display: inline-block; border-radius: 3px; }
+        #refreshStatus { color: #666; font-size: 0.8em; margin-top: 5px; }
+        #lastUpdate { color: #666; font-size: 0.8em; margin-top: 5px; }
+        .header { display: flex; justify-content: space-between; align-items: center; }
+        button { padding: 5px 10px; background-color: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        button:hover { background-color: #45a049; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>WhisperLiveKit Status Monitor</h1>
+        <div>
+            <button id="refreshButton" onclick="manualRefresh()">Refresh Now</button>
+            <div id="refreshStatus">Auto-refresh: Active</div>
+            <div id="lastUpdate">Last update: Never</div>
+        </div>
+    </div>
+    <div id="summary" class="stats"></div>
+    <div id="instances"></div>
+
+    <script>
+        let refreshInterval = null;
+        let refreshing = false;
+        
+        function formatDateTime(date) {
+            const hours = String(date.getHours()).padStart(2, '0');
+            const minutes = String(date.getMinutes()).padStart(2, '0');
+            const seconds = String(date.getSeconds()).padStart(2, '0');
+            return `${hours}:${minutes}:${seconds}`;
+        }
+        
+        function updateLastUpdateTime() {
+            const now = new Date();
+            document.getElementById('lastUpdate').textContent = `Last update: ${formatDateTime(now)}`;
+        }
+        
+        function manualRefresh() {
+            if (refreshing) return;
+            refreshing = true;
+            
+            document.getElementById('refreshButton').textContent = 'Refreshing...';
+            document.getElementById('refreshButton').disabled = true;
+            
+            updateStatus()
+                .finally(() => {
+                    document.getElementById('refreshButton').textContent = 'Refresh Now';
+                    document.getElementById('refreshButton').disabled = false;
+                    refreshing = false;
+                });
+        }
+        
+        function startAutoRefresh() {
+            stopAutoRefresh(); // Clear any existing interval
+            refreshInterval = setInterval(updateStatus, 5000);
+            document.getElementById('refreshStatus').textContent = 'Auto-refresh: Active';
+        }
+        
+        function stopAutoRefresh() {
+            if (refreshInterval) {
+                clearInterval(refreshInterval);
+                refreshInterval = null;
+                document.getElementById('refreshStatus').textContent = 'Auto-refresh: Paused';
+            }
+        }
+        
+        function toggleAutoRefresh() {
+            if (refreshInterval) {
+                stopAutoRefresh();
+            } else {
+                startAutoRefresh();
+            }
+        }
+
+        async function updateStatus() {
+            try {
+                const response = await fetch('/api/status');
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP error! Status: ${response.status}`);
+                }
+                
+                const data = await response.json();
+                
+                // Update summary
+                document.getElementById('summary').innerHTML = `
+                    <p><strong>Total Instances:</strong> ${data.total_instances}</p>
+                    <p><strong>Total Clients:</strong> ${data.total_clients}</p>
+                    <p><strong>Diarization:</strong> ${data.diarization_enabled ? 'Enabled' : 'Disabled'}</p>
+                `;
+
+                // Update instances
+                const instancesEl = document.getElementById('instances');
+                instancesEl.innerHTML = '';
+
+                data.instances.forEach(instance => {
+                    const isFull = instance.clients_connected >= instance.max_clients;
+                    const instanceEl = document.createElement('div');
+                    instanceEl.className = `instance ${isFull ? 'full' : ''}`;
+                    
+                    const clientsHtml = instance.client_ids.map(
+                        id => `<span class="client">${id}</span>`
+                    ).join('');
+
+                    instanceEl.innerHTML = `
+                        <h3>Instance ${instance.id}</h3>
+                        <p><strong>Backend:</strong> ${instance.backend}</p>
+                        <p><strong>Model:</strong> ${instance.model}</p>
+                        <p><strong>Clients:</strong> ${instance.clients_connected}/${instance.max_clients} ${isFull ? '(FULL)' : ''}</p>
+                        <div class="clients">
+                            ${clientsHtml}
+                        </div>
+                    `;
+                    instancesEl.appendChild(instanceEl);
+                });
+                
+                // Update last refresh time
+                updateLastUpdateTime();
+                return true;
+            } catch (error) {
+                console.error('Error fetching status:', error);
+                document.getElementById('summary').innerHTML = `
+                    <p style="color: red;">Error connecting to API: ${error.message}</p>
+                    <p>The server might be unavailable or restarting. Will retry automatically.</p>
+                `;
+                return false;
+            }
+        }
+
+        // Add event listener for page visibility changes
+        document.addEventListener('visibilitychange', function() {
+            if (document.visibilityState === 'visible') {
+                // When page becomes visible again, force update and restart refresh
+                manualRefresh();
+                startAutoRefresh();
+            } else {
+                // When page is hidden, pause auto-refresh to save resources
+                stopAutoRefresh();
+            }
+        });
+
+        // Update immediately on page load
+        updateStatus().then(() => {
+            // Start auto-refresh only after the initial update completes
+            startAutoRefresh();
+        });
+        
+        // Double-check that our interval is actually running by periodically verifying
+        setInterval(() => {
+            if (!refreshInterval) {
+                console.log("Auto-refresh interval not running, restarting...");
+                startAutoRefresh();
+            }
+        }, 30000); // Check every 30 seconds
+    </script>
+</body>
+</html>
