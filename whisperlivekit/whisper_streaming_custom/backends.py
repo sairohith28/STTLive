@@ -561,12 +561,12 @@ class ParakeetTDTASR(ASRBase):
                 logger.info("Successfully installed and imported NVIDIA NeMo toolkit")
             
             # Set model name for Parakeet TDT
-            # model_name = "nvidia/parakeet-tdt-0.6b-v2"
-            # if modelsize and modelsize.startswith("nvidia/parakeet"):
-            #     model_name = modelsize
-            model_name = "nvidia/stt_en_fastconformer_transducer_large"
-            if modelsize and modelsize.startswith("nvidia/canary"):
+            model_name = "nvidia/parakeet-tdt-0.6b-v2"
+            if modelsize and modelsize.startswith("nvidia/parakeet"):
                 model_name = modelsize
+            # model_name = "nvidia/stt_en_fastconformer_transducer_large"
+            # if modelsize and modelsize.startswith("nvidia/canary"):
+            #     model_name = modelsize
             logger.info(f"Loading Parakeet TDT model: {model_name}")
             
             # Clear CUDA cache before loading model if using GPU
